@@ -10,15 +10,14 @@ All notable changes to riverctl will be documented in this file.
   startup and never again, so after a re-key it kept listening to a contract
   nobody writes to: no error, no output, just a room that appeared to go quiet
   until the bot was restarted. It now re-checks every few minutes and, when
-  River has re-keyed, **exits with status 75** so a supervisor restarts it — a
-  restarted riverctl follows the new address through the normal startup path.
-  If River has re-keyed to a version newer than this riverctl, it keeps running
-  and prints an upgrade warning instead, since restarting would not help.
+  River's pointer names a different generation, **exits with status 75** so a
+  supervisor restarts it. A restarted riverctl uses the current generation.
   (freenet/river#694)
 
-  **If you run a bot, run it under something that restarts it**, and treat
-  status 75 as "restart me" rather than as a failure. See "Running
-  `message stream` as a long-lived bot" in the README.
+  **If you run a bot, run it under something that restarts it on any failure,
+  with a short delay** (systemd `Restart=on-failure` plus `RestartSec=`), and
+  note that a restart with `--initial-messages N` re-emits the last N messages.
+  See "Running `message stream` as a long-lived bot" in the README.
 
 ## [0.2.15] - 2026-09-06
 

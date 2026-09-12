@@ -2221,19 +2221,32 @@ mod tests {
             ),
             (
                 "subscribe_and_stream",
-                body_of("    pub async fn subscribe_and_stream(", "\n}\n"),
+                body_of("    pub async fn subscribe_and_stream(", "\n    }\n"),
             ),
         ] {
+            let call = body
+                .find("Self::act_on_recheck(self.recheck_room_anchor().await")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} must re-check the pointer and act on the result; without it a \
+                         re-key leaves the stream listening to a contract nobody writes to"
+                    )
+                });
+            // And behind its timer. Without the gate the re-check fires on every
+            // loop iteration — a pointer GET per poll, and in lockstep across a
+            // fleet — and every other test here still passes.
+            let gate = body
+                .find("if std::time::Instant::now() >= next_recheck {")
+                .unwrap_or_else(|| panic!("{name} must gate the re-check on its interval"));
             assert!(
-                body.contains("Self::act_on_recheck(self.recheck_room_anchor().await"),
-                "{name} must re-check the pointer and act on the result; without it a \
-                 re-key leaves the stream listening to a contract nobody writes to"
+                gate < call && !body[gate..call].contains("\n            }"),
+                "{name}'s re-check must sit INSIDE the `>= next_recheck` gate"
             );
         }
 
         // The subscription loop's re-check reads from the same connection and can
         // discard a notification for this room, so it must queue a re-fetch.
-        let sub = body_of("    pub async fn subscribe_and_stream(", "\n}\n");
+        let sub = body_of("    pub async fn subscribe_and_stream(", "\n    }\n");
         let recheck_at = sub.find("Self::act_on_recheck(").expect("checked above");
         let refetch_at = sub[recheck_at..]
             .find("pending.push_back(")

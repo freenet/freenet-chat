@@ -124,16 +124,13 @@ async fn main() -> std::process::ExitCode {
     match run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
-            // A re-key is a restart request, not a crash: print its own message
-            // rather than the `Error:` debug dump, and exit with the status a
-            // supervisor can recognise. Every other error prints and exits
-            // exactly as it did when `main` returned `Result` directly.
-            if let Some(rekeyed) = e.downcast_ref::<riverctl::error::RoomContractRekeyed>() {
-                eprintln!("{rekeyed}");
-            } else {
-                eprintln!("Error: {e:?}");
-            }
-            std::process::ExitCode::from(riverctl::error::exit_code_for(&e))
+            // See `riverctl::error::report`. Written with the error ignored, like
+            // the std `Termination` impl this replaces: a closed stderr must not
+            // turn an ordinary failure into a panic.
+            let (message, code) = riverctl::error::report(&e);
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{message}");
+            std::process::ExitCode::from(code)
         }
     }
 }

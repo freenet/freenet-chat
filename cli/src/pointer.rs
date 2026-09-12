@@ -342,17 +342,20 @@ impl RoomAnchor {
 /// that runs on every invocation. A mid-run copy of all that was tried in #696
 /// and did not survive review. So the answer to "River re-keyed" is to exit and
 /// be restarted.
+///
+/// That holds even when the new generation is one this binary does not know. A
+/// stream only reads, and reads are permitted against any generation (see
+/// [`RoomAnchor::authorize`]), so a restarted process can stream the new
+/// generation as soon as anyone has moved the room there — while a process that
+/// stayed put would keep listening to the retired one. The restarted process also
+/// prints the existing "this riverctl is older than River's room contract"
+/// advisory, which is what tells the operator to upgrade.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recheck {
     /// Nothing that should change what this process is doing.
     Unchanged,
-    /// River re-keyed to a generation this binary knows. A restarted process
-    /// will follow it, so exit and let the supervisor restart.
-    RestartToFollow { from: [u8; 32], to: [u8; 32] },
-    /// River re-keyed to a generation this binary does NOT know. Restarting
-    /// would not help — a fresh process of this same binary cannot use it either
-    /// — so keep running on what still works and say an upgrade is needed.
-    UpgradeRequired { from: [u8; 32], to: [u8; 32] },
+    /// River's pointer now names a different generation: exit and be restarted.
+    Moved { from: [u8; 32], to: [u8; 32] },
 }
 
 /// Compare a freshly-resolved anchor with the one a command started with.
@@ -366,10 +369,31 @@ pub fn recheck(in_force: &RoomAnchor, fresh: &RoomAnchor) -> Recheck {
     if fresh.code_hash() == in_force.code_hash() || fresh.source() != &AnchorSource::Pointer {
         return Recheck::Unchanged;
     }
-    let (from, to) = (*in_force.code_hash(), *fresh.code_hash());
-    match fresh.generation() {
-        Generation::Unknown => Recheck::UpgradeRequired { from, to },
-        Generation::Bundled | Generation::Legacy(_) => Recheck::RestartToFollow { from, to },
+    Recheck::Moved {
+        from: *in_force.code_hash(),
+        to: *fresh.code_hash(),
+    }
+}
+
+/// The higher of a floor this process has already verified and the one just
+/// read from disk.
+///
+/// The anti-rollback floor is what makes a genuinely-signed OLDER record
+/// unusable, and it is re-read from disk on every resolution. Persisting it is
+/// best-effort, though (a read-only config directory is enough to skip it), so
+/// the disk can be behind what this process verified at startup. A periodic
+/// re-check reading only the disk would then accept an older signed record as a
+/// move and restart onto it. A signature establishes authenticity, not
+/// freshness; this supplies the freshness the disk could not.
+///
+/// "Higher" is by version, except that at EQUAL versions a withdrawal wins:
+/// dropping a tombstone for a same-version record would resurrect exactly what
+/// the author retired.
+pub fn highest_floor(remembered: Option<PointerFloor>, on_disk: PointerFloor) -> PointerFloor {
+    match remembered {
+        Some(mem) if mem.version() > on_disk.version() => mem,
+        Some(mem) if mem.version() == on_disk.version() && mem.is_withdrawn() => mem,
+        _ => on_disk,
     }
 }
 
@@ -768,32 +792,64 @@ mod tests {
         assert_eq!(recheck(&in_force, &fallback), Recheck::Unchanged);
     }
 
-    /// A verified re-key to a generation this binary knows: restart to follow.
+    /// A verified re-key to a generation this binary knows: restart.
     #[test]
     fn recheck_restarts_for_a_verified_move_to_a_known_generation() {
         let legacy = river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES[3];
         assert_eq!(
             recheck(&verified(legacy), &verified(bundled())),
-            Recheck::RestartToFollow {
+            Recheck::Moved {
                 from: legacy,
                 to: bundled()
             }
         );
     }
 
-    /// A verified re-key PAST this binary: restarting would not help, so the
-    /// answer is to ask for an upgrade, not to exit.
+    /// A verified re-key PAST this binary restarts too. A stream only reads, and
+    /// reads are permitted against an unknown generation, so a restarted process
+    /// can stream it once the room has been moved there; staying put would keep
+    /// listening to the retired generation.
     #[test]
-    fn recheck_requires_an_upgrade_for_a_move_past_this_binary() {
+    fn recheck_restarts_for_a_verified_move_past_this_binary_too() {
         let past_us = verified([0x11; 32]);
         assert_eq!(past_us.generation(), Generation::Unknown);
+        past_us
+            .authorize(KeyIntent::Read)
+            .expect("the premise: a stale riverctl may READ an unknown generation");
         assert_eq!(
             recheck(&verified(bundled()), &past_us),
-            Recheck::UpgradeRequired {
+            Recheck::Moved {
                 from: bundled(),
                 to: [0x11; 32]
             }
         );
+    }
+
+    /// If the floor could not be saved, the disk can be behind what this process
+    /// verified. The remembered floor must win, or an older signed record would be
+    /// accepted as a move.
+    #[test]
+    fn the_remembered_floor_beats_a_disk_that_fell_behind() {
+        let old = PointerFloor::at(3, [0xAA; 32]).unwrap();
+        let new = PointerFloor::at(9, [0xBB; 32]).unwrap();
+
+        assert_eq!(
+            highest_floor(None, old).version(),
+            3,
+            "nothing remembered yet"
+        );
+        assert_eq!(
+            highest_floor(Some(new), old).version(),
+            9,
+            "disk fell behind"
+        );
+        assert_eq!(highest_floor(Some(old), new).version(), 9, "disk is ahead");
+
+        // Equal versions: a withdrawal wins from either side.
+        let tombstone = PointerFloor::withdrawn_at(9).unwrap();
+        let live_at_9 = PointerFloor::at(9, [0xCC; 32]).unwrap();
+        assert!(highest_floor(Some(tombstone), live_at_9).is_withdrawn());
+        assert!(highest_floor(Some(live_at_9), tombstone).is_withdrawn());
     }
 
     #[test]

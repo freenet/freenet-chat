@@ -38,10 +38,10 @@ pub const EXIT_ROOM_CONTRACT_REKEYED: u8 = 75;
 /// path. See [`crate::pointer::Recheck`].
 #[derive(Error, Debug)]
 #[error(
-    "River re-keyed the room contract while this command was running.\n  \
-     was: {from}\n  now: {to}\n\
-     Exiting with status {code} so it can be restarted; a restarted riverctl follows the new \
-     generation automatically.",
+    "River's pointer now names a different room-contract generation than this command started \
+     with.\n  was: {from}\n  now: {to}\n\
+     Exiting with status {code} so it can be restarted; a restarted riverctl uses the current \
+     generation.",
     code = EXIT_ROOM_CONTRACT_REKEYED
 )]
 pub struct RoomContractRekeyed {
@@ -59,6 +59,21 @@ pub fn exit_code_for(err: &anyhow::Error) -> u8 {
         EXIT_ROOM_CONTRACT_REKEYED
     } else {
         1
+    }
+}
+
+/// What `main` writes to stderr, and the status it exits with, for a command that
+/// ended in `err`.
+///
+/// Split out of `main` so the whole mapping is testable, not just the status. A
+/// re-key prints its own message rather than the `Error:` debug dump, because it
+/// is a restart request and should not read as a crash. Every other error prints
+/// `Error: {err:?}` and exits 1 — exactly what `main` returning `Result` produced
+/// before, so no other command's output or status changes.
+pub fn report(err: &anyhow::Error) -> (String, u8) {
+    match err.downcast_ref::<RoomContractRekeyed>() {
+        Some(rekeyed) => (rekeyed.to_string(), EXIT_ROOM_CONTRACT_REKEYED),
+        None => (format!("Error: {err:?}"), exit_code_for(err)),
     }
 }
 
@@ -87,16 +102,34 @@ mod tests {
         assert_eq!(exit_code_for(&wrapped), 75);
     }
 
-    /// The message names both generations and says what happens next, because
-    /// the operator's first question is whether this is a crash.
+    /// A re-key prints its own message, names both generations, and says what
+    /// happens next — because the operator's first question is whether it crashed.
     #[test]
-    fn the_message_says_it_is_a_restart_not_a_crash() {
-        let msg = rekeyed().to_string();
+    fn a_rekey_reports_a_restart_not_a_crash() {
+        let (msg, code) = report(&rekeyed().into());
+        assert_eq!(code, 75);
+        assert!(
+            !msg.starts_with("Error:"),
+            "a restart must not read as a crash: {msg}"
+        );
         assert!(
             msg.contains("was: old") && msg.contains("now: new"),
             "{msg}"
         );
-        assert!(msg.contains("status 75"), "{msg}");
-        assert!(msg.contains("restarted"), "{msg}");
+        assert!(
+            msg.contains("status 75") && msg.contains("restarted"),
+            "{msg}"
+        );
+    }
+
+    /// Every other error reports exactly as `main` returning `Result` did: the
+    /// `Error:` debug dump and status 1. This is what keeps the change from
+    /// altering any other command.
+    #[test]
+    fn every_other_error_reports_exactly_as_before() {
+        let err = anyhow::anyhow!("room not found").context("while listing messages");
+        let (msg, code) = report(&err);
+        assert_eq!(code, 1);
+        assert_eq!(msg, format!("Error: {err:?}"));
     }
 }

@@ -2363,6 +2363,11 @@ pub struct ApiClient {
     /// happens where its failure can be reported against the operation that
     /// needed it.
     room_anchor: tokio::sync::OnceCell<RoomAnchor>,
+    /// The highest anti-rollback floor this process has verified. Consulted on
+    /// every resolution alongside the one on disk; see
+    /// `crate::pointer::highest_floor`. A `std::sync::Mutex` held only for a copy
+    /// or an assignment, never across an await.
+    pointer_floor: std::sync::Mutex<Option<PointerFloor>>,
 }
 
 impl ApiClient {
@@ -2405,7 +2410,22 @@ impl ApiClient {
             config,
             storage,
             room_anchor: tokio::sync::OnceCell::new(),
+            pointer_floor: std::sync::Mutex::new(None),
         })
+    }
+
+    fn remembered_floor(&self) -> Option<PointerFloor> {
+        *self
+            .pointer_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn remember_floor(&self, floor: PointerFloor) {
+        *self
+            .pointer_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(floor);
     }
 
     /// River's room-contract generation for this run, resolved once.
@@ -2460,12 +2480,17 @@ impl ApiClient {
         // `StoredFloor::to_floor`: `never_resolved` is the one state that
         // re-enables the build-time key, so "recovering" into it is the
         // downgrade the floor exists to prevent.
-        let floor = match self.storage.load_pointer_floor(&key)? {
+        let on_disk = match self.storage.load_pointer_floor(&key)? {
             Some(stored) => stored.to_floor().with_context(|| {
                 crate::pointer::floor_corruption_hint(self.storage.pointer_floors_path())
             })?,
             None => PointerFloor::never_resolved(),
         };
+        // Whichever is higher: the disk's floor, or the highest this process has
+        // already verified. They differ only when a save failed, which is exactly
+        // when relying on the disk alone would let a periodic re-check accept an
+        // older signed record. See `crate::pointer::highest_floor`.
+        let floor = crate::pointer::highest_floor(self.remembered_floor(), on_disk);
 
         let mut io = NodePointerIo {
             web_api: &self.web_api,
@@ -2485,6 +2510,10 @@ impl ApiClient {
         // pre-withdrawal record and resurrect the retired code.
         if let ResolveReport::Outcome(outcome) = &report {
             if let Some(next) = outcome.next_floor() {
+                // Remembered regardless of whether the save below lands: this is
+                // the anti-rollback guarantee for the rest of the run when it
+                // does not.
+                self.remember_floor(next);
                 if let Err(e) = self
                     .storage
                     .save_pointer_floor(&key, StoredFloor::from_floor(&next))
@@ -2513,41 +2542,21 @@ impl ApiClient {
 
     /// Turn a re-check into what a stream loop does next.
     ///
-    /// `Err` ends the stream: either River re-keyed to a generation a restart
-    /// will follow ([`crate::error::RoomContractRekeyed`], exit status 75), or
-    /// the re-check itself failed. The second is not a timeout — an unreachable
+    /// `Err` ends the stream: either River's pointer moved
+    /// ([`crate::error::RoomContractRekeyed`], exit status 75, restart me), or the
+    /// re-check itself failed. The second is not a timeout — an unreachable
     /// pointer comes back as an unverified anchor, not an error — so what reaches
     /// here is a corrupt anti-rollback floor or a signed withdrawal, both of which
     /// a fresh process would also refuse at startup.
-    ///
-    /// `warned` remembers the last generation an upgrade warning was printed for,
-    /// so a stale riverctl says so once per re-key rather than every few minutes.
-    fn act_on_recheck(
-        result: Result<crate::pointer::Recheck>,
-        warned: &mut Option<[u8; 32]>,
-    ) -> Result<()> {
+    fn act_on_recheck(result: Result<crate::pointer::Recheck>) -> Result<()> {
         use crate::pointer::{code_hash_b58, Recheck};
         match result? {
             Recheck::Unchanged => Ok(()),
-            Recheck::RestartToFollow { from, to } => Err(crate::error::RoomContractRekeyed {
+            Recheck::Moved { from, to } => Err(crate::error::RoomContractRekeyed {
                 from: code_hash_b58(&from),
                 to: code_hash_b58(&to),
             }
             .into()),
-            Recheck::UpgradeRequired { from, to } => {
-                if *warned != Some(to) {
-                    *warned = Some(to);
-                    eprintln!(
-                        "warning: River re-keyed the room contract to a generation this riverctl \
-                         does not know.\n  was: {}\n  now: {}\n\
-                         Continuing on the current generation, but restarting will not help: \
-                         upgrade with `cargo install riverctl --force`, then restart.",
-                        code_hash_b58(&from),
-                        code_hash_b58(&to),
-                    );
-                }
-                Ok(())
-            }
         }
     }
 
@@ -5292,7 +5301,6 @@ impl ApiClient {
         // River can re-key the room contract while this runs. See
         // `crate::pointer::Recheck`.
         let mut next_recheck = std::time::Instant::now() + recheck_delay();
-        let mut warned_upgrade: Option<[u8; 32]> = None;
 
         // Main polling loop
         loop {
@@ -5318,7 +5326,7 @@ impl ApiClient {
 
             if std::time::Instant::now() >= next_recheck {
                 next_recheck = std::time::Instant::now() + recheck_delay();
-                Self::act_on_recheck(self.recheck_room_anchor().await, &mut warned_upgrade)?;
+                Self::act_on_recheck(self.recheck_room_anchor().await)?;
             }
 
             // Poll for new + edited messages. emit_new_and_edited re-emits a
@@ -6503,7 +6511,6 @@ impl ApiClient {
         // River can re-key the room contract while this runs. See
         // `crate::pointer::Recheck`.
         let mut next_recheck = std::time::Instant::now() + recheck_delay();
-        let mut warned_upgrade: Option<[u8; 32]> = None;
 
         // Main loop: wait for UpdateNotification messages
         loop {
@@ -6530,7 +6537,7 @@ impl ApiClient {
             // Before taking the connection lock: the re-check needs it too.
             if std::time::Instant::now() >= next_recheck {
                 next_recheck = std::time::Instant::now() + recheck_delay();
-                Self::act_on_recheck(self.recheck_room_anchor().await, &mut warned_upgrade)?;
+                Self::act_on_recheck(self.recheck_room_anchor().await)?;
                 // The re-check's pointer GET reads from the same connection as
                 // this subscription, and steps over (discarding) anything else
                 // that arrives while it waits — which can be a notification for
@@ -9213,46 +9220,21 @@ mod recheck_tests {
     use super::*;
     use crate::pointer::Recheck;
 
-    const A: [u8; 32] = [0xAA; 32];
-    const B: [u8; 32] = [0xBB; 32];
-    const C: [u8; 32] = [0xCC; 32];
-
     #[test]
     fn nothing_moved_means_the_stream_carries_on() {
-        let mut warned = None;
-        ApiClient::act_on_recheck(Ok(Recheck::Unchanged), &mut warned).unwrap();
-        assert_eq!(warned, None);
+        ApiClient::act_on_recheck(Ok(Recheck::Unchanged)).unwrap();
     }
 
-    /// A move a restart will follow ends the stream with the restart status, so
-    /// a supervisor restarts it rather than treating it as a crash.
+    /// A move ends the stream with the restart status, so a supervisor restarts it
+    /// rather than treating it as a crash.
     #[test]
-    fn a_followable_move_ends_the_stream_with_the_restart_status() {
-        let mut warned = None;
-        let err =
-            ApiClient::act_on_recheck(Ok(Recheck::RestartToFollow { from: A, to: B }), &mut warned)
-                .expect_err("a re-key a restart will follow must end the stream");
+    fn a_move_ends_the_stream_with_the_restart_status() {
+        let err = ApiClient::act_on_recheck(Ok(Recheck::Moved {
+            from: [0xAA; 32],
+            to: [0xBB; 32],
+        }))
+        .expect_err("a move must end the stream");
         assert_eq!(crate::error::exit_code_for(&err), 75);
-    }
-
-    /// A move past this binary does NOT end the stream — a restart of the same
-    /// binary would not help — and warns once per re-key, not every few minutes.
-    #[test]
-    fn a_move_past_this_binary_warns_once_per_rekey_and_keeps_running() {
-        let mut warned = None;
-        let past_us = Recheck::UpgradeRequired { from: A, to: B };
-
-        ApiClient::act_on_recheck(Ok(past_us), &mut warned).expect("keeps running");
-        assert_eq!(warned, Some(B));
-
-        // Same re-key seen again on the next re-check: nothing new to say.
-        ApiClient::act_on_recheck(Ok(past_us), &mut warned).expect("keeps running");
-        assert_eq!(warned, Some(B));
-
-        // River re-keys AGAIN, still past us: that is new, so it is said again.
-        ApiClient::act_on_recheck(Ok(Recheck::UpgradeRequired { from: A, to: C }), &mut warned)
-            .expect("keeps running");
-        assert_eq!(warned, Some(C));
     }
 
     /// A failed re-check ends the stream as an ordinary failure (status 1), not
@@ -9260,8 +9242,7 @@ mod recheck_tests {
     /// as an unverified anchor) but a corrupt floor or a signed withdrawal.
     #[test]
     fn a_failed_recheck_is_an_ordinary_failure_not_a_restart() {
-        let mut warned = None;
-        let err = ApiClient::act_on_recheck(Err(anyhow!("floor is corrupt")), &mut warned)
+        let err = ApiClient::act_on_recheck(Err(anyhow!("floor is corrupt")))
             .expect_err("a failed re-check must not be silently ignored");
         assert_eq!(crate::error::exit_code_for(&err), 1);
     }
