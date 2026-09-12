@@ -2,6 +2,24 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.2.18] - 2026-09-12
+
+### Fixed
+- `message stream` no longer goes silently deaf when River re-keys the room
+  contract while it is running. It used to look up the room's address once at
+  startup and never again, so after a re-key it kept listening to a contract
+  nobody writes to: no error, no output, just a room that appeared to go quiet
+  until the bot was restarted. It now re-checks every few minutes and, when
+  River has re-keyed, **exits with status 75** so a supervisor restarts it — a
+  restarted riverctl follows the new address through the normal startup path.
+  If River has re-keyed to a version newer than this riverctl, it keeps running
+  and prints an upgrade warning instead, since restarting would not help.
+  (freenet/river#694)
+
+  **If you run a bot, run it under something that restarts it**, and treat
+  status 75 as "restart me" rather than as a failure. See "Running
+  `message stream` as a long-lived bot" in the README.
+
 ## [0.2.15] - 2026-09-06
 
 ### Fixed

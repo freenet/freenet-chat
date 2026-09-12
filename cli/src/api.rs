@@ -2333,6 +2333,23 @@ impl std::fmt::Debug for Invitation {
     }
 }
 
+/// How often a long-running command re-checks River's pointer, before jitter.
+///
+/// A re-check is one GET of a fixed address. Five minutes bounds how long a
+/// stream can keep listening to a retired generation after a re-key, at a cost
+/// far below what the stream already spends.
+const RECHECK_INTERVAL: Duration = Duration::from_secs(300);
+
+/// [`RECHECK_INTERVAL`] with ±20% jitter.
+///
+/// A re-key makes every running stream exit around the same time, and their
+/// supervisors restart them together. Without jitter they would then stay in
+/// lockstep, re-checking — and after the next re-key, restarting — as one burst.
+fn recheck_delay() -> Duration {
+    let factor = 0.8 + rand::Rng::gen::<f64>(&mut rand::thread_rng()) * 0.4;
+    RECHECK_INTERVAL.mul_f64(factor)
+}
+
 pub struct ApiClient {
     web_api: Arc<Mutex<WebApi>>,
     #[allow(dead_code)]
@@ -2404,6 +2421,37 @@ impl ApiClient {
     /// Resolve River's room-contract pointer, persist the anti-rollback floor,
     /// and announce anything the user needs to know.
     async fn resolve_room_anchor(&self) -> Result<RoomAnchor> {
+        let anchor = self.resolve_pointer().await?;
+
+        // Once per run, on stderr, so it is visible in a pipeline whose stdout
+        // is being parsed. Repeating it per derived key would train users to
+        // ignore it.
+        if let Some(advisory) = anchor.advisory() {
+            eprintln!("{advisory}");
+        }
+        info!(
+            "Room-contract generation for this run: {} ({:?}, {:?})",
+            crate::pointer::code_hash_b58(anchor.code_hash()),
+            anchor.generation(),
+            anchor.source(),
+        );
+
+        // Let the local room cache regenerate its keys against the same
+        // generation the network paths use, instead of against the bundled WASM.
+        self.storage.set_room_code_hash(*anchor.code_hash());
+        Ok(anchor)
+    }
+
+    /// Resolve the pointer and persist the anti-rollback floor, WITHOUT
+    /// announcing the result or installing it.
+    ///
+    /// Split from [`Self::resolve_room_anchor`] for the periodic re-check a
+    /// long-running command makes: that re-check only needs to know whether the
+    /// generation moved. Announcing would reprint the same advisory every few
+    /// minutes, and installing is pointless because a moved generation ends the
+    /// process (see [`crate::pointer::Recheck`]). Advancing the floor, on the other
+    /// hand, is exactly as correct mid-run as at startup.
+    async fn resolve_pointer(&self) -> Result<RoomAnchor> {
         let bundled = bundled_room_code_hash();
         let author_vk = river_author_vk()?;
         let key = floor_key(&author_vk, ROOM_CONTRACT_APP_ID);
@@ -2449,25 +2497,58 @@ impl ApiClient {
             }
         }
 
-        let anchor = anchor_from_report(&report, &floor, bundled)?;
+        anchor_from_report(&report, &floor, bundled)
+    }
 
-        // Once per run, on stderr, so it is visible in a pipeline whose stdout
-        // is being parsed. Repeating it per derived key would train users to
-        // ignore it.
-        if let Some(advisory) = anchor.advisory() {
-            eprintln!("{advisory}");
+    /// Re-check River's pointer against the generation this run started with.
+    ///
+    /// For long-running commands. See [`crate::pointer::Recheck`] for why the
+    /// response to a re-key is to exit and be restarted rather than to follow it
+    /// in place.
+    pub async fn recheck_room_anchor(&self) -> Result<crate::pointer::Recheck> {
+        let in_force = self.room_anchor().await?.clone();
+        let fresh = self.resolve_pointer().await?;
+        Ok(crate::pointer::recheck(&in_force, &fresh))
+    }
+
+    /// Turn a re-check into what a stream loop does next.
+    ///
+    /// `Err` ends the stream: either River re-keyed to a generation a restart
+    /// will follow ([`crate::error::RoomContractRekeyed`], exit status 75), or
+    /// the re-check itself failed. The second is not a timeout — an unreachable
+    /// pointer comes back as an unverified anchor, not an error — so what reaches
+    /// here is a corrupt anti-rollback floor or a signed withdrawal, both of which
+    /// a fresh process would also refuse at startup.
+    ///
+    /// `warned` remembers the last generation an upgrade warning was printed for,
+    /// so a stale riverctl says so once per re-key rather than every few minutes.
+    fn act_on_recheck(
+        result: Result<crate::pointer::Recheck>,
+        warned: &mut Option<[u8; 32]>,
+    ) -> Result<()> {
+        use crate::pointer::{code_hash_b58, Recheck};
+        match result? {
+            Recheck::Unchanged => Ok(()),
+            Recheck::RestartToFollow { from, to } => Err(crate::error::RoomContractRekeyed {
+                from: code_hash_b58(&from),
+                to: code_hash_b58(&to),
+            }
+            .into()),
+            Recheck::UpgradeRequired { from, to } => {
+                if *warned != Some(to) {
+                    *warned = Some(to);
+                    eprintln!(
+                        "warning: River re-keyed the room contract to a generation this riverctl \
+                         does not know.\n  was: {}\n  now: {}\n\
+                         Continuing on the current generation, but restarting will not help: \
+                         upgrade with `cargo install riverctl --force`, then restart.",
+                        code_hash_b58(&from),
+                        code_hash_b58(&to),
+                    );
+                }
+                Ok(())
+            }
         }
-        info!(
-            "Room-contract generation for this run: {} ({:?}, {:?})",
-            crate::pointer::code_hash_b58(anchor.code_hash()),
-            anchor.generation(),
-            anchor.source(),
-        );
-
-        // Let the local room cache regenerate its keys against the same
-        // generation the network paths use, instead of against the bundled WASM.
-        self.storage.set_room_code_hash(*anchor.code_hash());
-        Ok(anchor)
     }
 
     /// The room-contract key for `owner_vk` under this run's resolved
@@ -5208,6 +5289,11 @@ impl ApiClient {
             let _ = shutdown_tx.send(()).await;
         });
 
+        // River can re-key the room contract while this runs. See
+        // `crate::pointer::Recheck`.
+        let mut next_recheck = std::time::Instant::now() + recheck_delay();
+        let mut warned_upgrade: Option<[u8; 32]> = None;
+
         // Main polling loop
         loop {
             // Check for shutdown signal
@@ -5228,6 +5314,11 @@ impl ApiClient {
             if max_messages > 0 && new_message_count >= max_messages {
                 debug!("Maximum message count reached, exiting stream");
                 return Ok(());
+            }
+
+            if std::time::Instant::now() >= next_recheck {
+                next_recheck = std::time::Instant::now() + recheck_delay();
+                Self::act_on_recheck(self.recheck_room_anchor().await, &mut warned_upgrade)?;
             }
 
             // Poll for new + edited messages. emit_new_and_edited re-emits a
@@ -6409,6 +6500,11 @@ impl ApiClient {
             let _ = shutdown_tx.send(()).await;
         });
 
+        // River can re-key the room contract while this runs. See
+        // `crate::pointer::Recheck`.
+        let mut next_recheck = std::time::Instant::now() + recheck_delay();
+        let mut warned_upgrade: Option<[u8; 32]> = None;
+
         // Main loop: wait for UpdateNotification messages
         loop {
             // Check for shutdown signal
@@ -6429,6 +6525,27 @@ impl ApiClient {
             if max_messages > 0 && new_message_count >= max_messages {
                 debug!("Maximum message count reached, exiting subscription stream");
                 return Ok(());
+            }
+
+            // Before taking the connection lock: the re-check needs it too.
+            if std::time::Instant::now() >= next_recheck {
+                next_recheck = std::time::Instant::now() + recheck_delay();
+                Self::act_on_recheck(self.recheck_room_anchor().await, &mut warned_upgrade)?;
+                // The re-check's pointer GET reads from the same connection as
+                // this subscription, and steps over (discarding) anything else
+                // that arrives while it waits — which can be a notification for
+                // this very room. Queue one so the handler below re-fetches full
+                // state, exactly as if it had arrived; that handler ignores the
+                // payload. Without this, a message landing during the re-check
+                // would stay unseen until the room's next message.
+                pending.push_back(HostResponse::ContractResponse(
+                    ContractResponse::UpdateNotification {
+                        key: contract_key,
+                        update: freenet_stdlib::prelude::UpdateData::Delta(
+                            freenet_stdlib::prelude::StateDelta::from(Vec::new()),
+                        ),
+                    },
+                ));
             }
 
             // Wait for next message with a short timeout to allow checking shutdown
@@ -9088,6 +9205,83 @@ mod reaccept_guard_tests {
             "the re-accept guard must run BEFORE the network GET so a refused re-accept \
              does no network or storage work"
         );
+    }
+}
+
+#[cfg(test)]
+mod recheck_tests {
+    use super::*;
+    use crate::pointer::Recheck;
+
+    const A: [u8; 32] = [0xAA; 32];
+    const B: [u8; 32] = [0xBB; 32];
+    const C: [u8; 32] = [0xCC; 32];
+
+    #[test]
+    fn nothing_moved_means_the_stream_carries_on() {
+        let mut warned = None;
+        ApiClient::act_on_recheck(Ok(Recheck::Unchanged), &mut warned).unwrap();
+        assert_eq!(warned, None);
+    }
+
+    /// A move a restart will follow ends the stream with the restart status, so
+    /// a supervisor restarts it rather than treating it as a crash.
+    #[test]
+    fn a_followable_move_ends_the_stream_with_the_restart_status() {
+        let mut warned = None;
+        let err =
+            ApiClient::act_on_recheck(Ok(Recheck::RestartToFollow { from: A, to: B }), &mut warned)
+                .expect_err("a re-key a restart will follow must end the stream");
+        assert_eq!(crate::error::exit_code_for(&err), 75);
+    }
+
+    /// A move past this binary does NOT end the stream — a restart of the same
+    /// binary would not help — and warns once per re-key, not every few minutes.
+    #[test]
+    fn a_move_past_this_binary_warns_once_per_rekey_and_keeps_running() {
+        let mut warned = None;
+        let past_us = Recheck::UpgradeRequired { from: A, to: B };
+
+        ApiClient::act_on_recheck(Ok(past_us), &mut warned).expect("keeps running");
+        assert_eq!(warned, Some(B));
+
+        // Same re-key seen again on the next re-check: nothing new to say.
+        ApiClient::act_on_recheck(Ok(past_us), &mut warned).expect("keeps running");
+        assert_eq!(warned, Some(B));
+
+        // River re-keys AGAIN, still past us: that is new, so it is said again.
+        ApiClient::act_on_recheck(Ok(Recheck::UpgradeRequired { from: A, to: C }), &mut warned)
+            .expect("keeps running");
+        assert_eq!(warned, Some(C));
+    }
+
+    /// A failed re-check ends the stream as an ordinary failure (status 1), not
+    /// as a restart request. What can fail here is not a timeout (that comes back
+    /// as an unverified anchor) but a corrupt floor or a signed withdrawal.
+    #[test]
+    fn a_failed_recheck_is_an_ordinary_failure_not_a_restart() {
+        let mut warned = None;
+        let err = ApiClient::act_on_recheck(Err(anyhow!("floor is corrupt")), &mut warned)
+            .expect_err("a failed re-check must not be silently ignored");
+        assert_eq!(crate::error::exit_code_for(&err), 1);
+    }
+
+    /// Without jitter, a fleet of bots restarted together after one re-key stays
+    /// in lockstep for the next. A jitter function that returned a constant would
+    /// pass a bounds check, so pin the spread too.
+    #[test]
+    fn the_recheck_interval_is_jittered_within_twenty_percent() {
+        let base = RECHECK_INTERVAL.as_secs_f64();
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let d = recheck_delay().as_secs_f64();
+            assert!(
+                d >= base * 0.8 && d < base * 1.2,
+                "{d} outside ±20% of {base}"
+            );
+            distinct.insert(d.to_bits());
+        }
+        assert!(distinct.len() > 100, "the interval must actually vary");
     }
 }
 

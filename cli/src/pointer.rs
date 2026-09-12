@@ -329,6 +329,50 @@ impl RoomAnchor {
     }
 }
 
+/// What a long-running command should do after re-checking River's pointer.
+///
+/// A long-running command (`message stream`) resolves the room-contract
+/// generation once, at startup, like every other command. If River re-keys while
+/// it runs, the room's address changes underneath it and it would otherwise keep
+/// listening to a contract nobody writes to, with no error (freenet/river#694).
+///
+/// It does not try to follow the move in place. Everything a re-key needs —
+/// resolving the new generation, migrating the room, healing membership,
+/// subscribing — is what a fresh process already does at startup, through code
+/// that runs on every invocation. A mid-run copy of all that was tried in #696
+/// and did not survive review. So the answer to "River re-keyed" is to exit and
+/// be restarted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recheck {
+    /// Nothing that should change what this process is doing.
+    Unchanged,
+    /// River re-keyed to a generation this binary knows. A restarted process
+    /// will follow it, so exit and let the supervisor restart.
+    RestartToFollow { from: [u8; 32], to: [u8; 32] },
+    /// River re-keyed to a generation this binary does NOT know. Restarting
+    /// would not help — a fresh process of this same binary cannot use it either
+    /// — so keep running on what still works and say an upgrade is needed.
+    UpgradeRequired { from: [u8; 32], to: [u8; 32] },
+}
+
+/// Compare a freshly-resolved anchor with the one a command started with.
+///
+/// Only a signature-verified record counts as a move. A re-check that could not
+/// reach the pointer still produces an anchor — on the last hash this install
+/// persisted, or the BUNDLED hash if it never persisted one — and that fallback
+/// can differ from the generation in use without River having re-keyed at all.
+/// Restarting on it would make a single timeout look like a re-key.
+pub fn recheck(in_force: &RoomAnchor, fresh: &RoomAnchor) -> Recheck {
+    if fresh.code_hash() == in_force.code_hash() || fresh.source() != &AnchorSource::Pointer {
+        return Recheck::Unchanged;
+    }
+    let (from, to) = (*in_force.code_hash(), *fresh.code_hash());
+    match fresh.generation() {
+        Generation::Unknown => Recheck::UpgradeRequired { from, to },
+        Generation::Bundled | Generation::Legacy(_) => Recheck::RestartToFollow { from, to },
+    }
+}
+
 /// What a resolution attempt produced, flattened so the arm-by-arm mapping
 /// below is a pure function that needs no node and no generic error type.
 #[derive(Debug, Clone)]
@@ -678,6 +722,77 @@ mod tests {
             ROOM_CONTRACT_POINTER_KEY,
             "the author key and app_id in this module no longer derive the pointer address \
              published in FREENET.md"
+        );
+    }
+
+    /// Resolve an anchor from a genuine signed record naming `hash`.
+    fn verified(hash: [u8; 32]) -> RoomAnchor {
+        let author = SigningKey::from_bytes(&[3u8; 32]);
+        anchor_from_report(
+            &ResolveReport::Outcome(outcome_for(
+                &author,
+                PointerFloor::never_resolved(),
+                4,
+                hash,
+            )),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap()
+    }
+
+    /// A re-check that names the generation already in use changes nothing.
+    #[test]
+    fn recheck_ignores_a_reconfirmed_generation() {
+        let anchor = verified(bundled());
+        assert_eq!(recheck(&anchor, &anchor), Recheck::Unchanged);
+    }
+
+    /// The case that makes "restart on any hash change" wrong. A re-check that
+    /// could not reach the pointer falls back to the last persisted hash, or the
+    /// bundled one, and that can differ from the generation in use with no
+    /// re-key having happened. Restarting on it would turn a timeout into a
+    /// restart.
+    #[test]
+    fn recheck_ignores_an_unverified_hash_change() {
+        let legacy = river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES[3];
+        let in_force = verified(legacy);
+        // Unreachable pointer, never-persisted floor: the fallback is bundled.
+        let fallback = anchor_from_report(
+            &ResolveReport::Failed("timed out".to_string()),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap();
+        assert_ne!(fallback.code_hash(), in_force.code_hash());
+        assert_eq!(recheck(&in_force, &fallback), Recheck::Unchanged);
+    }
+
+    /// A verified re-key to a generation this binary knows: restart to follow.
+    #[test]
+    fn recheck_restarts_for_a_verified_move_to_a_known_generation() {
+        let legacy = river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES[3];
+        assert_eq!(
+            recheck(&verified(legacy), &verified(bundled())),
+            Recheck::RestartToFollow {
+                from: legacy,
+                to: bundled()
+            }
+        );
+    }
+
+    /// A verified re-key PAST this binary: restarting would not help, so the
+    /// answer is to ask for an upgrade, not to exit.
+    #[test]
+    fn recheck_requires_an_upgrade_for_a_move_past_this_binary() {
+        let past_us = verified([0x11; 32]);
+        assert_eq!(past_us.generation(), Generation::Unknown);
+        assert_eq!(
+            recheck(&verified(bundled()), &past_us),
+            Recheck::UpgradeRequired {
+                from: bundled(),
+                to: [0x11; 32]
+            }
         );
     }
 

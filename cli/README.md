@@ -307,6 +307,40 @@ compare like against like (see "Managing your identity" above). Inside `reply_to
 `author` is a display **nickname**, not an ID — the id there is `author_id`, and
 it has no full-key sibling, so it is not something to trust on.
 
+### Running `message stream` as a long-lived bot
+
+River occasionally re-keys its room contract, which moves every room to a new
+address. A running `message stream` checks for this every few minutes. When it
+sees one, it **exits with status 75** and says so on stderr:
+
+```text
+River re-keyed the room contract while this command was running.
+  was: <old generation>
+  now: <new generation>
+Exiting with status 75 so it can be restarted; a restarted riverctl follows the new generation automatically.
+```
+
+Restarting is all that is needed: a fresh `riverctl` finds the new address,
+carries the room across, and resubscribes. So run a bot under something that
+restarts it — systemd with `Restart=on-failure`, a supervisor, or a shell loop:
+
+```bash
+until riverctl message stream <room-owner-vk> --format json; do
+  status=$?
+  [ "$status" -eq 75 ] || exit "$status"   # anything else is a real failure
+  sleep 2
+done
+```
+
+Status 75 is `EX_TEMPFAIL` ("temporary failure, retry"), so it is distinct from
+the status 1 every other failure uses, and a wrapper can restart on it without
+parsing stderr. Use `--initial-messages N` if the bot must not miss messages
+sent during the moment it is restarting.
+
+If River has re-keyed to a version **newer than your riverctl**, it does *not*
+exit, because a restart of the same binary would not help. It keeps running and
+prints a warning to upgrade (`cargo install riverctl --force`) once per re-key.
+
 ## Configuration
 
 - `--node-url <URL>`: override the Freenet node URL (default `ws://127.0.0.1:7509/...`).

@@ -120,7 +120,25 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // A re-key is a restart request, not a crash: print its own message
+            // rather than the `Error:` debug dump, and exit with the status a
+            // supervisor can recognise. Every other error prints and exits
+            // exactly as it did when `main` returned `Result` directly.
+            if let Some(rekeyed) = e.downcast_ref::<riverctl::error::RoomContractRekeyed>() {
+                eprintln!("{rekeyed}");
+            } else {
+                eprintln!("Error: {e:?}");
+            }
+            std::process::ExitCode::from(riverctl::error::exit_code_for(&e))
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging (keep stdout clean for user/JSON output)

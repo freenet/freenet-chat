@@ -2191,6 +2191,65 @@ mod tests {
         );
     }
 
+    /// Source-grep pin: BOTH `message stream` loops must re-check River's
+    /// pointer, and the subscription loop must re-fetch after doing so.
+    ///
+    /// The decision logic is unit-tested; nothing else notices a loop that stops
+    /// calling it, and the symptom of that — a stream silently listening to a
+    /// retired contract — is the bug this exists to fix (freenet/river#694).
+    ///
+    /// In storage.rs so the pinned strings are not satisfied by this test's own
+    /// source.
+    #[test]
+    fn both_stream_loops_recheck_the_room_contract_pointer() {
+        let api_src = include_str!("api.rs");
+        let body_of = |start: &str, end: &str| -> &str {
+            api_src
+                .split_once(start)
+                .and_then(|(_, rest)| rest.split_once(end))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("could not isolate the body after `{start}`"))
+        };
+
+        for (name, body) in [
+            (
+                "stream_messages (polling)",
+                body_of(
+                    "    pub async fn stream_messages(",
+                    "\n    fn emit_new_and_edited(",
+                ),
+            ),
+            (
+                "subscribe_and_stream",
+                body_of("    pub async fn subscribe_and_stream(", "\n}\n"),
+            ),
+        ] {
+            assert!(
+                body.contains("Self::act_on_recheck(self.recheck_room_anchor().await"),
+                "{name} must re-check the pointer and act on the result; without it a \
+                 re-key leaves the stream listening to a contract nobody writes to"
+            );
+        }
+
+        // The subscription loop's re-check reads from the same connection and can
+        // discard a notification for this room, so it must queue a re-fetch.
+        let sub = body_of("    pub async fn subscribe_and_stream(", "\n}\n");
+        let recheck_at = sub.find("Self::act_on_recheck(").expect("checked above");
+        let refetch_at = sub[recheck_at..]
+            .find("pending.push_back(")
+            .map(|i| recheck_at + i);
+        let next_lock = sub[recheck_at..]
+            .find("let mut web_api = self.web_api.lock().await;")
+            .map(|i| recheck_at + i)
+            .expect("the loop must take the connection lock after the re-check");
+        assert!(
+            refetch_at.is_some_and(|r| r < next_lock),
+            "after re-checking the pointer, subscribe_and_stream must queue a re-fetch \
+             before it next reads the connection, or a message that arrived during the \
+             re-check stays unseen"
+        );
+    }
+
     /// Source-grep pins for the monitor edit/reply wiring (PR #322), in
     /// storage.rs so the pinned strings aren't self-satisfied by the scanned
     /// file (api.rs). Guards the exact regressions the PR fixed: a refactor
