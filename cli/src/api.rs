@@ -5245,13 +5245,10 @@ impl ApiClient {
         // Track seen messages: key -> last-emitted effective content, so a later
         // edit (content change) is detected and re-emitted, not just new ids.
         let mut seen_messages: HashMap<String, String> = HashMap::new();
-        // Messages for which a deletion has already been emitted (one-shot). The
-        // polling path needs NO startup pre-seed (unlike subscribe): it only ever
-        // inserts into `seen` via `display_messages()` (initial window + each
-        // poll's emit_new_and_edited), which excludes deleted messages — so a
-        // pre-existing deletion is never in `seen` and `should_emit_deletion`
-        // returns false for it. (A future change that seeds `seen` from raw
-        // `messages` here would need a pre-seed like the subscribe path's.)
+        // Messages for which a deletion has already been emitted, or must never be
+        // (one-shot). `seed_stream` pre-fills it with every message the stream did
+        // not show at start, because it records the whole window as seen — see
+        // there.
         let mut deleted_emitted: HashSet<String> = HashSet::new();
         // Reactions fingerprint per SURFACED message, so a reaction added/removed
         // AFTER the message was streamed surfaces as a `reaction` event
@@ -5276,13 +5273,17 @@ impl ApiClient {
                     &secrets,
                     initial_messages,
                     &mut seen_messages,
+                    &mut deleted_emitted,
                     &mut seen_reactions,
                     room_owner_key,
                     &format,
                 )?;
                 seeded = true;
             }
-            Err(e) => debug!("Could not fetch room state at stream start (will retry): {e}"),
+            // Once, on stderr: this used to exit with `-i N`, and it is now a
+            // silent retry unless said. Later poll failures stay at `debug!`, as
+            // they always have.
+            Err(e) => eprintln!("note: could not fetch room state yet ({e}); will keep polling"),
         }
 
         // Set up Ctrl+C handler
@@ -5336,6 +5337,7 @@ impl ApiClient {
                         &secrets,
                         initial_messages,
                         &mut seen_messages,
+                        &mut deleted_emitted,
                         &mut seen_reactions,
                         room_owner_key,
                         &format,
@@ -5411,18 +5413,17 @@ impl ApiClient {
     /// every re-key. The subscription path already seeds the whole window; this
     /// brings polling into line.
     ///
-    /// Seeds from `display_messages()`, which excludes deleted messages, so a
-    /// deletion that predates the stream is never in `seen` and needs no
-    /// suppression (see the note on `deleted_emitted` in `stream_messages`).
-    /// Reaction fingerprints are seeded only for the messages actually shown, the
-    /// same rule the subscription path follows: a reaction change on a message the
-    /// stream never displayed is not reported.
+    /// Deletions are suppressed for every message not shown, so a later deletion
+    /// of one the consumer never received is not reported. Reaction fingerprints
+    /// are seeded only for the messages actually shown. Both follow the rules the
+    /// subscription path already uses.
     #[allow(clippy::too_many_arguments)]
     fn seed_stream(
         room_state: &ChatRoomStateV1,
         secrets: &HashMap<u32, [u8; 32]>,
         initial_messages: usize,
         seen_messages: &mut HashMap<String, String>,
+        deleted_emitted: &mut HashSet<String>,
         seen_reactions: &mut HashMap<String, String>,
         room_owner_key: &VerifyingKey,
         format: &OutputFormat,
@@ -5435,6 +5436,19 @@ impl ApiClient {
             );
         }
         let start = all_msgs.len().saturating_sub(initial_messages);
+        // Recording every message as seen is what stops the first poll replaying
+        // history, but it also makes each of them eligible for a `delete` event.
+        // Suppress that for every message NOT shown now, exactly as the
+        // subscription path does (#324): a consumer must never be told a message
+        // it never received was deleted.
+        let shown_keys: HashSet<String> = all_msgs[start..]
+            .iter()
+            .map(|m| monitor_seen_key(m))
+            .collect();
+        deleted_emitted.extend(deletions_to_suppress_at_start(
+            &room_state.recent_messages.messages,
+            &shown_keys,
+        ));
         for msg in &all_msgs[start..] {
             seen_reactions.insert(
                 monitor_seen_key(msg),
@@ -9765,9 +9779,6 @@ mod monitor_tests {
         AuthorizedMessageV1::new(m, &sk)
     }
 
-    /// A `ChatRoomStateV1` whose `recent_messages` contains `original` plus the
-    /// given reaction action messages, with `actions_state` rebuilt so
-    /// `reactions()` reflects them.
     /// The polling stream's startup must record EVERY message the room already
     /// holds, and print only the last `initial_messages`. It used to record only
     /// the ones it printed, so the first poll re-emitted the rest as new: all of
@@ -9781,7 +9792,7 @@ mod monitor_tests {
             .collect();
         let state = {
             let mut recent = MessagesV1 {
-                messages: msgs,
+                messages: msgs.clone(),
                 ..Default::default()
             };
             recent.rebuild_actions_state();
@@ -9802,6 +9813,7 @@ mod monitor_tests {
                 &secrets,
                 initial,
                 &mut seen,
+                &mut deleted,
                 &mut reactions,
                 &owner_vk,
                 &OutputFormat::Json,
@@ -9835,9 +9847,23 @@ mod monitor_tests {
                 new_count, 0,
                 "-i {initial}: the first poll of an unchanged room must emit nothing"
             );
+
+            // Recording every message as seen must not make each one eligible for
+            // a `delete` event. The first message is never among those shown for
+            // -i 0 or -i 1, so its deletion must be suppressed; with -i 3 it WAS
+            // shown, so its deletion must be reported.
+            let first = &msgs[0];
+            assert_eq!(
+                should_emit_deletion(&seen, &deleted, &monitor_seen_key(first)),
+                initial == 3,
+                "-i {initial}: a deletion is reported only for a message the stream showed"
+            );
         }
     }
 
+    /// A `ChatRoomStateV1` whose `recent_messages` contains `original` plus the
+    /// given reaction action messages, with `actions_state` rebuilt so
+    /// `reactions()` reflects them.
     fn state_with_reactions(
         original: &AuthorizedMessageV1,
         reaction_actions: Vec<AuthorizedMessageV1>,

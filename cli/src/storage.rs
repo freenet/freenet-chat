@@ -426,7 +426,27 @@ impl Storage {
             } else {
                 FloorStore::default()
             };
-            store.floors.insert(key.to_string(), floor);
+            // Never move a floor backwards, even if the caller asks to. The
+            // read-then-save here is not atomic with the caller's resolution: a
+            // long-running stream re-resolves every few minutes, so another
+            // riverctl sharing this config directory can advance the floor between
+            // this process loading it and saving it. Blindly inserting would then
+            // overwrite the newer floor with an older one, and every later process
+            // would accept records the newer floor exists to reject. Deciding
+            // under the lock, by the same rule the resolver uses, keeps the
+            // persisted floor monotonic. A stored entry that will not decode is
+            // replaced, which is what this did before; loading surfaces that
+            // corruption elsewhere.
+            let chosen = match (
+                store.floors.get(key).map(StoredFloor::to_floor),
+                floor.to_floor(),
+            ) {
+                (Some(Ok(stored)), Ok(proposed)) => {
+                    StoredFloor::from_floor(&crate::pointer::highest_floor(Some(proposed), stored))
+                }
+                _ => floor,
+            };
+            store.floors.insert(key.to_string(), chosen);
             Self::atomic_write(
                 &self.pointer_floors_path,
                 &serde_json::to_string_pretty(&store)?,
@@ -2321,6 +2341,25 @@ mod tests {
             polling.contains("Ok(mut room_state) if !seeded =>"),
             "an unseeded polling stream must seed instead of emitting"
         );
+        // Each seed must actually MARK the stream seeded, or the `!seeded` arm
+        // keeps re-seeding — re-printing the initial window on every poll.
+        for (i, _) in polling.match_indices("Self::seed_stream(") {
+            let after = &polling[i..];
+            let next_arm = after[1..]
+                .find("Self::")
+                .map(|j| j + 1)
+                .unwrap_or(after.len());
+            assert!(
+                after[..after.len().min(next_arm.max(400))].contains("seeded = true;"),
+                "every seed_stream call in stream_messages must be followed by `seeded = true;`"
+            );
+        }
+        // And seeding must suppress deletions of messages it did not show.
+        let seed = body_of("    fn seed_stream(");
+        assert!(
+            seed.contains("deleted_emitted.extend(deletions_to_suppress_at_start("),
+            "seed_stream must suppress deletions of messages it did not show (#324)"
+        );
         // The poll sleep must not outlast the next re-check, or a long
         // `--poll-interval` defeats the re-check interval entirely.
         assert!(
@@ -2437,6 +2476,56 @@ mod tests {
         assert_eq!(
             retrieved_state.configuration.configuration.max_members,
             state.configuration.configuration.max_members
+        );
+    }
+
+    /// A floor save must never move the persisted floor backwards. Another
+    /// riverctl sharing the config directory can advance it between a stream's
+    /// load and its save, and a blind overwrite would then let every later
+    /// process accept records that floor exists to reject.
+    #[test]
+    fn saving_an_older_pointer_floor_does_not_regress_the_stored_one() {
+        use freenet_migrate::pointer::PointerFloor;
+        let (storage, _temp_dir) = create_test_storage();
+        let key = "river.room-contract";
+        let stored = |s: &Storage| {
+            s.load_pointer_floor(key)
+                .unwrap()
+                .expect("a floor was saved")
+                .to_floor()
+                .unwrap()
+        };
+
+        let newer = PointerFloor::at(9, [0xBB; 32]).unwrap();
+        let older = PointerFloor::at(3, [0xAA; 32]).unwrap();
+        storage
+            .save_pointer_floor(key, StoredFloor::from_floor(&newer))
+            .unwrap();
+        storage
+            .save_pointer_floor(key, StoredFloor::from_floor(&older))
+            .unwrap();
+        assert_eq!(stored(&storage).version(), 9, "an older save must not win");
+
+        // A genuinely newer floor still replaces it.
+        let newest = PointerFloor::at(12, [0xCC; 32]).unwrap();
+        storage
+            .save_pointer_floor(key, StoredFloor::from_floor(&newest))
+            .unwrap();
+        assert_eq!(stored(&storage).version(), 12);
+
+        // Equal versions follow the resolver's tiebreak: the lower hash stays.
+        let lower = PointerFloor::at(12, [0x11; 32]).unwrap();
+        storage
+            .save_pointer_floor(key, StoredFloor::from_floor(&lower))
+            .unwrap();
+        assert_eq!(stored(&storage).code_hash(), Some([0x11; 32]));
+        storage
+            .save_pointer_floor(key, StoredFloor::from_floor(&newest))
+            .unwrap();
+        assert_eq!(
+            stored(&storage).code_hash(),
+            Some([0x11; 32]),
+            "the higher hash at the same version must not replace the lower"
         );
     }
 

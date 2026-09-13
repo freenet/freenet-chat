@@ -365,16 +365,17 @@ failures should be left stopped.
 
 **Restarting can re-deliver messages.** A restarted stream starts with no memory
 of what it already emitted. With `--initial-messages N`, it re-emits the last N
-messages as new, which covers anything sent while it was restarting but repeats
-what you had already seen. If the bot acts on messages, deduplicate on
+messages as new, which covers up to N messages sent while it was restarting but
+repeats what you had already seen. If the bot acts on messages, deduplicate on
 `message_id`. Without `--initial-messages`, nothing is repeated, but messages sent
 during the restart are not shown.
 
 If River has re-keyed to a version **newer than your riverctl**, the restarted
 process still streams the room once it has been moved to the new address, and
 prints a warning telling you to upgrade (`cargo install riverctl`). Until the room
-has been moved — which an up-to-date River client does when someone opens it — it
-keeps failing and being restarted.
+has been moved — which an up-to-date River client does when someone opens it —
+`--subscribe` keeps failing and being restarted, while polling mode stays running
+and keeps retrying.
 
 ## Configuration
 

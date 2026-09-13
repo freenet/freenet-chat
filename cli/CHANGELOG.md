@@ -24,6 +24,9 @@ All notable changes to riverctl will be documented in this file.
   new, and with `-i N` it reported all but N of them. It now records everything
   already in the room and shows only the last N, as `--subscribe` always has.
   This matters more now that streams restart on every re-key.
+- A polling `message stream` whose `--poll-interval` is longer than the re-check
+  interval (a few minutes) now also polls at each re-check, so a long interval
+  cannot delay noticing a re-key.
 
 ## [0.2.15] - 2026-09-06
 
