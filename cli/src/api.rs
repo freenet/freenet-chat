@@ -2333,6 +2333,23 @@ impl std::fmt::Debug for Invitation {
     }
 }
 
+/// How often a long-running command re-checks River's pointer, before jitter.
+///
+/// A re-check is one GET of a fixed address. Five minutes bounds how long a
+/// stream can keep listening to a retired generation after a re-key, at a cost
+/// far below what the stream already spends.
+const RECHECK_INTERVAL: Duration = Duration::from_secs(300);
+
+/// [`RECHECK_INTERVAL`] with ±20% jitter.
+///
+/// A re-key makes every running stream exit around the same time, and their
+/// supervisors restart them together. Without jitter they would then stay in
+/// lockstep, re-checking — and after the next re-key, restarting — as one burst.
+fn recheck_delay() -> Duration {
+    let factor = 0.8 + rand::Rng::gen::<f64>(&mut rand::thread_rng()) * 0.4;
+    RECHECK_INTERVAL.mul_f64(factor)
+}
+
 pub struct ApiClient {
     web_api: Arc<Mutex<WebApi>>,
     #[allow(dead_code)]
@@ -2346,6 +2363,11 @@ pub struct ApiClient {
     /// happens where its failure can be reported against the operation that
     /// needed it.
     room_anchor: tokio::sync::OnceCell<RoomAnchor>,
+    /// The highest anti-rollback floor this process has verified. Consulted on
+    /// every resolution alongside the one on disk; see
+    /// `crate::pointer::highest_floor`. A `std::sync::Mutex` held only for a copy
+    /// or an assignment, never across an await.
+    pointer_floor: std::sync::Mutex<Option<PointerFloor>>,
 }
 
 impl ApiClient {
@@ -2388,7 +2410,22 @@ impl ApiClient {
             config,
             storage,
             room_anchor: tokio::sync::OnceCell::new(),
+            pointer_floor: std::sync::Mutex::new(None),
         })
+    }
+
+    fn remembered_floor(&self) -> Option<PointerFloor> {
+        *self
+            .pointer_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn remember_floor(&self, floor: PointerFloor) {
+        *self
+            .pointer_floor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(floor);
     }
 
     /// River's room-contract generation for this run, resolved once.
@@ -2404,6 +2441,37 @@ impl ApiClient {
     /// Resolve River's room-contract pointer, persist the anti-rollback floor,
     /// and announce anything the user needs to know.
     async fn resolve_room_anchor(&self) -> Result<RoomAnchor> {
+        let anchor = self.resolve_pointer().await?;
+
+        // Once per run, on stderr, so it is visible in a pipeline whose stdout
+        // is being parsed. Repeating it per derived key would train users to
+        // ignore it.
+        if let Some(advisory) = anchor.advisory() {
+            eprintln!("{advisory}");
+        }
+        info!(
+            "Room-contract generation for this run: {} ({:?}, {:?})",
+            crate::pointer::code_hash_b58(anchor.code_hash()),
+            anchor.generation(),
+            anchor.source(),
+        );
+
+        // Let the local room cache regenerate its keys against the same
+        // generation the network paths use, instead of against the bundled WASM.
+        self.storage.set_room_code_hash(*anchor.code_hash());
+        Ok(anchor)
+    }
+
+    /// Resolve the pointer and persist the anti-rollback floor, WITHOUT
+    /// announcing the result or installing it.
+    ///
+    /// Split from [`Self::resolve_room_anchor`] for the periodic re-check a
+    /// long-running command makes: that re-check only needs to know whether the
+    /// generation moved. Announcing would reprint the same advisory every few
+    /// minutes, and installing is pointless because a moved generation ends the
+    /// process (see [`crate::pointer::Recheck`]). Advancing the floor, on the other
+    /// hand, is exactly as correct mid-run as at startup.
+    async fn resolve_pointer(&self) -> Result<RoomAnchor> {
         let bundled = bundled_room_code_hash();
         let author_vk = river_author_vk()?;
         let key = floor_key(&author_vk, ROOM_CONTRACT_APP_ID);
@@ -2412,12 +2480,18 @@ impl ApiClient {
         // `StoredFloor::to_floor`: `never_resolved` is the one state that
         // re-enables the build-time key, so "recovering" into it is the
         // downgrade the floor exists to prevent.
-        let floor = match self.storage.load_pointer_floor(&key)? {
+        let on_disk = match self.storage.load_pointer_floor(&key)? {
             Some(stored) => stored.to_floor().with_context(|| {
                 crate::pointer::floor_corruption_hint(self.storage.pointer_floors_path())
             })?,
             None => PointerFloor::never_resolved(),
         };
+        // Whichever is higher: the disk's floor, or the highest this process has
+        // already verified. They differ when a save failed — exactly when relying
+        // on the disk alone would let a periodic re-check accept an older signed
+        // record — or when another riverctl has written the disk since. See
+        // `crate::pointer::highest_floor`.
+        let floor = crate::pointer::highest_floor(self.remembered_floor(), on_disk);
 
         let mut io = NodePointerIo {
             web_api: &self.web_api,
@@ -2437,6 +2511,10 @@ impl ApiClient {
         // pre-withdrawal record and resurrect the retired code.
         if let ResolveReport::Outcome(outcome) = &report {
             if let Some(next) = outcome.next_floor() {
+                // Remembered regardless of whether the save below lands: this is
+                // the anti-rollback guarantee for the rest of the run when it
+                // does not.
+                self.remember_floor(next);
                 if let Err(e) = self
                     .storage
                     .save_pointer_floor(&key, StoredFloor::from_floor(&next))
@@ -2449,25 +2527,39 @@ impl ApiClient {
             }
         }
 
-        let anchor = anchor_from_report(&report, &floor, bundled)?;
+        anchor_from_report(&report, &floor, bundled)
+    }
 
-        // Once per run, on stderr, so it is visible in a pipeline whose stdout
-        // is being parsed. Repeating it per derived key would train users to
-        // ignore it.
-        if let Some(advisory) = anchor.advisory() {
-            eprintln!("{advisory}");
+    /// Re-check River's pointer against the generation this run started with.
+    ///
+    /// For long-running commands. See [`crate::pointer::Recheck`] for why the
+    /// response to a re-key is to exit and be restarted rather than to follow it
+    /// in place.
+    pub async fn recheck_room_anchor(&self) -> Result<crate::pointer::Recheck> {
+        let in_force = self.room_anchor().await?.clone();
+        let fresh = self.resolve_pointer().await?;
+        Ok(crate::pointer::recheck(&in_force, &fresh))
+    }
+
+    /// Turn a re-check into what a stream loop does next.
+    ///
+    /// `Err` ends the stream: either River's pointer moved
+    /// ([`crate::error::RoomContractRekeyed`], exit status 75, restart me), or the
+    /// re-check itself failed. The second is not a timeout — an unreachable
+    /// pointer comes back as an unverified anchor, not an error — so what reaches
+    /// here is a corrupt or unreadable anti-rollback floor, or a signed withdrawal.
+    /// A fresh process would refuse those at startup too, so ending the stream as
+    /// an ordinary failure (status 1) is the honest report.
+    fn act_on_recheck(result: Result<crate::pointer::Recheck>) -> Result<()> {
+        use crate::pointer::{code_hash_b58, Recheck};
+        match result? {
+            Recheck::Unchanged => Ok(()),
+            Recheck::Moved { from, to } => Err(crate::error::RoomContractRekeyed {
+                from: code_hash_b58(&from),
+                to: code_hash_b58(&to),
+            }
+            .into()),
         }
-        info!(
-            "Room-contract generation for this run: {} ({:?}, {:?})",
-            crate::pointer::code_hash_b58(anchor.code_hash()),
-            anchor.generation(),
-            anchor.source(),
-        );
-
-        // Let the local room cache regenerate its keys against the same
-        // generation the network paths use, instead of against the bundled WASM.
-        self.storage.set_room_code_hash(*anchor.code_hash());
-        Ok(anchor)
     }
 
     /// The room-contract key for `owner_vk` under this run's resolved
@@ -5153,13 +5245,10 @@ impl ApiClient {
         // Track seen messages: key -> last-emitted effective content, so a later
         // edit (content change) is detected and re-emitted, not just new ids.
         let mut seen_messages: HashMap<String, String> = HashMap::new();
-        // Messages for which a deletion has already been emitted (one-shot). The
-        // polling path needs NO startup pre-seed (unlike subscribe): it only ever
-        // inserts into `seen` via `display_messages()` (initial window + each
-        // poll's emit_new_and_edited), which excludes deleted messages — so a
-        // pre-existing deletion is never in `seen` and `should_emit_deletion`
-        // returns false for it. (A future change that seeds `seen` from raw
-        // `messages` here would need a pre-seed like the subscribe path's.)
+        // Messages for which a deletion has already been emitted, or must never be
+        // (one-shot). `seed_stream` pre-fills it with every message the stream did
+        // not show at start, because it records the whole window as seen — see
+        // there.
         let mut deleted_emitted: HashSet<String> = HashSet::new();
         // Reactions fingerprint per SURFACED message, so a reaction added/removed
         // AFTER the message was streamed surfaces as a `reaction` event
@@ -5171,32 +5260,30 @@ impl ApiClient {
         let mut new_message_count = 0;
         let start_time = std::time::Instant::now();
 
-        // Show initial messages if requested
-        if initial_messages > 0 {
-            let mut room_state = self.get_room(room_owner_key, false).await?;
-            // Decrypt private-room content for display (no-op for public rooms).
-            let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
-
-            // Use display_messages() to filter out action/deleted messages (matches `message list`)
-            let all_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
-            let start = all_msgs.len().saturating_sub(initial_messages);
-
-            for msg in &all_msgs[start..] {
-                let key = monitor_seen_key(msg);
-                seen_messages.insert(
-                    key.clone(),
-                    message_display_text_with_secrets(&room_state, msg, &secrets),
-                );
-                // Seed the reactions fingerprint for shown messages so reactions
-                // already present at startup aren't re-emitted as a live change;
-                // only later changes to them surface.
-                seen_reactions.insert(
-                    key,
-                    reactions_fingerprint(room_state.recent_messages.reactions(&msg.id())),
-                );
-
-                Self::output_message(&room_state, msg, room_owner_key, &format, false, &secrets)?;
+        // Record what the room already holds before streaming, so the first poll
+        // does not report it as new. See `seed_stream`. A failure here is not
+        // fatal — the loop retries — and until a fetch succeeds the stream simply
+        // is not seeded yet; the first successful poll seeds instead of emitting.
+        let mut seeded = false;
+        match self.get_room(room_owner_key, false).await {
+            Ok(mut room_state) => {
+                let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
+                Self::seed_stream(
+                    &room_state,
+                    &secrets,
+                    initial_messages,
+                    &mut seen_messages,
+                    &mut deleted_emitted,
+                    &mut seen_reactions,
+                    room_owner_key,
+                    &format,
+                )?;
+                seeded = true;
             }
+            // Once, on stderr: this used to exit with `-i N`, and it is now a
+            // silent retry unless said. Later poll failures stay at `debug!`, as
+            // they always have.
+            Err(e) => eprintln!("note: could not fetch room state yet ({e}); will keep polling"),
         }
 
         // Set up Ctrl+C handler
@@ -5207,6 +5294,10 @@ impl ApiClient {
             tokio::signal::ctrl_c().await.ok();
             let _ = shutdown_tx.send(()).await;
         });
+
+        // River can re-key the room contract while this runs. See
+        // `crate::pointer::Recheck`.
+        let mut next_recheck = std::time::Instant::now() + recheck_delay();
 
         // Main polling loop
         loop {
@@ -5230,10 +5321,29 @@ impl ApiClient {
                 return Ok(());
             }
 
+            if std::time::Instant::now() >= next_recheck {
+                next_recheck = std::time::Instant::now() + recheck_delay();
+                Self::act_on_recheck(self.recheck_room_anchor().await)?;
+            }
+
             // Poll for new + edited messages. emit_new_and_edited re-emits a
             // message whose effective content changed (an edit) and emits ones
             // not seen before; it respects max_messages for NEW messages.
             match self.get_room(room_owner_key, false).await {
+                Ok(mut room_state) if !seeded => {
+                    let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
+                    Self::seed_stream(
+                        &room_state,
+                        &secrets,
+                        initial_messages,
+                        &mut seen_messages,
+                        &mut deleted_emitted,
+                        &mut seen_reactions,
+                        room_owner_key,
+                        &format,
+                    )?;
+                    seeded = true;
+                }
                 Ok(mut room_state) => {
                     // Decrypt private-room content for display (no-op for public rooms).
                     let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
@@ -5276,9 +5386,77 @@ impl ApiClient {
                 }
             }
 
-            // Wait for next poll interval
-            tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+            // Wait for the next poll — but never past the next re-check. With a
+            // `--poll-interval` longer than the re-check interval, sleeping the full
+            // interval would hold off noticing a re-key for as long as the interval
+            // (an hour, for an hourly poll). The cost is an extra poll at each
+            // re-check for such streams, which is one GET every few minutes.
+            let until_recheck = next_recheck.saturating_duration_since(std::time::Instant::now());
+            tokio::time::sleep(
+                std::time::Duration::from_millis(poll_interval_ms).min(until_recheck),
+            )
+            .await;
         }
+    }
+
+    /// Seed a polling stream with what the room already holds: every current
+    /// message is recorded as seen, and only the last `initial_messages` are
+    /// printed.
+    ///
+    /// Seeding the WHOLE window is the point, and it is what this used to get
+    /// wrong. The startup code recorded only the messages it displayed, so with
+    /// the default `--initial-messages 0` it recorded nothing, and the first poll
+    /// reported every recent message in the room as new; with `-i 5` it reported
+    /// all but five of them. That was an annoyance while restarts were rare. Once
+    /// a stream exits to be restarted on every room-contract re-key
+    /// (freenet/river#694), it would dump the room's recent history into a bot on
+    /// every re-key. The subscription path already seeds the whole window; this
+    /// brings polling into line.
+    ///
+    /// Deletions are suppressed for every message not shown, so a later deletion
+    /// of one the consumer never received is not reported. Reaction fingerprints
+    /// are seeded only for the messages actually shown. Both follow the rules the
+    /// subscription path already uses.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_stream(
+        room_state: &ChatRoomStateV1,
+        secrets: &HashMap<u32, [u8; 32]>,
+        initial_messages: usize,
+        seen_messages: &mut HashMap<String, String>,
+        deleted_emitted: &mut HashSet<String>,
+        seen_reactions: &mut HashMap<String, String>,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+    ) -> Result<()> {
+        let all_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
+        for msg in &all_msgs {
+            seen_messages.insert(
+                monitor_seen_key(msg),
+                message_display_text_with_secrets(room_state, msg, secrets),
+            );
+        }
+        let start = all_msgs.len().saturating_sub(initial_messages);
+        // Recording every message as seen is what stops the first poll replaying
+        // history, but it also makes each of them eligible for a `delete` event.
+        // Suppress that for every message NOT shown now, exactly as the
+        // subscription path does (#324): a consumer must never be told a message
+        // it never received was deleted.
+        let shown_keys: HashSet<String> = all_msgs[start..]
+            .iter()
+            .map(|m| monitor_seen_key(m))
+            .collect();
+        deleted_emitted.extend(deletions_to_suppress_at_start(
+            &room_state.recent_messages.messages,
+            &shown_keys,
+        ));
+        for msg in &all_msgs[start..] {
+            seen_reactions.insert(
+                monitor_seen_key(msg),
+                reactions_fingerprint(room_state.recent_messages.reactions(&msg.id())),
+            );
+            Self::output_message(room_state, msg, room_owner_key, format, false, secrets)?;
+        }
+        Ok(())
     }
 
     /// Scan the room's display messages and emit any that are NEW or whose
@@ -6409,6 +6587,10 @@ impl ApiClient {
             let _ = shutdown_tx.send(()).await;
         });
 
+        // River can re-key the room contract while this runs. See
+        // `crate::pointer::Recheck`.
+        let mut next_recheck = std::time::Instant::now() + recheck_delay();
+
         // Main loop: wait for UpdateNotification messages
         loop {
             // Check for shutdown signal
@@ -6429,6 +6611,27 @@ impl ApiClient {
             if max_messages > 0 && new_message_count >= max_messages {
                 debug!("Maximum message count reached, exiting subscription stream");
                 return Ok(());
+            }
+
+            // Before taking the connection lock: the re-check needs it too.
+            if std::time::Instant::now() >= next_recheck {
+                next_recheck = std::time::Instant::now() + recheck_delay();
+                Self::act_on_recheck(self.recheck_room_anchor().await)?;
+                // The re-check's pointer GET reads from the same connection as
+                // this subscription, and steps over (discarding) anything else
+                // that arrives while it waits — which can be a notification for
+                // this very room. Queue one so the handler below re-fetches full
+                // state, exactly as if it had arrived; that handler ignores the
+                // payload. Without this, a message landing during the re-check
+                // would stay unseen until the room's next message.
+                pending.push_back(HostResponse::ContractResponse(
+                    ContractResponse::UpdateNotification {
+                        key: contract_key,
+                        update: freenet_stdlib::prelude::UpdateData::Delta(
+                            freenet_stdlib::prelude::StateDelta::from(Vec::new()),
+                        ),
+                    },
+                ));
             }
 
             // Wait for next message with a short timeout to allow checking shutdown
@@ -9092,6 +9295,57 @@ mod reaccept_guard_tests {
 }
 
 #[cfg(test)]
+mod recheck_tests {
+    use super::*;
+    use crate::pointer::Recheck;
+
+    #[test]
+    fn nothing_moved_means_the_stream_carries_on() {
+        ApiClient::act_on_recheck(Ok(Recheck::Unchanged)).unwrap();
+    }
+
+    /// A move ends the stream with the restart status, so a supervisor restarts it
+    /// rather than treating it as a crash.
+    #[test]
+    fn a_move_ends_the_stream_with_the_restart_status() {
+        let err = ApiClient::act_on_recheck(Ok(Recheck::Moved {
+            from: [0xAA; 32],
+            to: [0xBB; 32],
+        }))
+        .expect_err("a move must end the stream");
+        assert_eq!(crate::error::exit_code_for(&err), 75);
+    }
+
+    /// A failed re-check ends the stream as an ordinary failure (status 1), not
+    /// as a restart request. What can fail here is not a timeout (that comes back
+    /// as an unverified anchor) but a corrupt floor or a signed withdrawal.
+    #[test]
+    fn a_failed_recheck_is_an_ordinary_failure_not_a_restart() {
+        let err = ApiClient::act_on_recheck(Err(anyhow!("floor is corrupt")))
+            .expect_err("a failed re-check must not be silently ignored");
+        assert_eq!(crate::error::exit_code_for(&err), 1);
+    }
+
+    /// Without jitter, a fleet of bots restarted together after one re-key stays
+    /// in lockstep for the next. A jitter function that returned a constant would
+    /// pass a bounds check, so pin the spread too.
+    #[test]
+    fn the_recheck_interval_is_jittered_within_twenty_percent() {
+        let base = RECHECK_INTERVAL.as_secs_f64();
+        let mut distinct = std::collections::HashSet::new();
+        for _ in 0..200 {
+            let d = recheck_delay().as_secs_f64();
+            assert!(
+                d >= base * 0.8 && d < base * 1.2,
+                "{d} outside ±20% of {base}"
+            );
+            distinct.insert(d.to_bits());
+        }
+        assert!(distinct.len() > 100, "the interval must actually vary");
+    }
+}
+
+#[cfg(test)]
 mod subscribe_handshake_tests {
     use super::*;
 
@@ -9523,6 +9777,88 @@ mod monitor_tests {
             time: SystemTime::UNIX_EPOCH + Duration::from_secs(actor as u64),
         };
         AuthorizedMessageV1::new(m, &sk)
+    }
+
+    /// The polling stream's startup must record EVERY message the room already
+    /// holds, and print only the last `initial_messages`. It used to record only
+    /// the ones it printed, so the first poll re-emitted the rest as new: all of
+    /// them with the default `-i 0`. Once a stream restarts on every re-key
+    /// (freenet/river#694) that would dump the room's history into a bot each time.
+    #[test]
+    fn a_seeded_poll_of_an_unchanged_room_emits_nothing() {
+        let msgs: Vec<_> = ["one", "two", "three"]
+            .iter()
+            .map(|t| authored(RoomMessageBody::public(t.to_string())))
+            .collect();
+        let state = {
+            let mut recent = MessagesV1 {
+                messages: msgs.clone(),
+                ..Default::default()
+            };
+            recent.rebuild_actions_state();
+            ChatRoomStateV1 {
+                recent_messages: recent,
+                ..Default::default()
+            }
+        };
+        let owner_vk = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+        let secrets = HashMap::new();
+
+        for initial in [0usize, 1, 3] {
+            let mut seen = HashMap::new();
+            let mut deleted = HashSet::new();
+            let mut reactions = HashMap::new();
+            ApiClient::seed_stream(
+                &state,
+                &secrets,
+                initial,
+                &mut seen,
+                &mut deleted,
+                &mut reactions,
+                &owner_vk,
+                &OutputFormat::Json,
+            )
+            .unwrap();
+            assert_eq!(
+                seen.len(),
+                3,
+                "-i {initial}: every message must be recorded"
+            );
+            assert_eq!(
+                reactions.len(),
+                initial,
+                "-i {initial}: reactions are seeded only for the messages shown"
+            );
+
+            let mut new_count = 0usize;
+            ApiClient::emit_new_and_edited(
+                &state,
+                &mut seen,
+                &mut deleted,
+                &mut reactions,
+                &owner_vk,
+                &OutputFormat::Json,
+                0,
+                &mut new_count,
+                &secrets,
+            )
+            .unwrap();
+            assert_eq!(
+                new_count, 0,
+                "-i {initial}: the first poll of an unchanged room must emit nothing"
+            );
+
+            // Recording every message as seen must not make each one eligible for
+            // a `delete` event. The first message is never among those shown for
+            // -i 0 or -i 1, so its deletion must be suppressed; with -i 3 it WAS
+            // shown, so its deletion must be reported.
+            let first = &msgs[0];
+            assert_eq!(
+                should_emit_deletion(&seen, &deleted, &monitor_seen_key(first)),
+                initial == 3,
+                "-i {initial}: a deletion is reported only for a message the stream showed"
+            );
+        }
     }
 
     /// A `ChatRoomStateV1` whose `recent_messages` contains `original` plus the

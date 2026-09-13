@@ -124,6 +124,11 @@ riverctl message stream <room-owner-vk> --format json --no-version-check |
   jq -c --arg me "$me" 'select(.author_verifying_key != $me)'
 ```
 
+For a bot that runs unattended, wrap this in something that restarts it — see
+"Running `message stream` as a long-lived bot" below. Note that a pipeline's exit
+status is the LAST command's, so a wrapper around this one sees `jq`'s status, not
+riverctl's; use `set -o pipefail` in bash, or restart on any exit.
+
 `message list` and `message stream --format json` both carry
 `author_verifying_key` — the author's full base58 key, comparable to `whoami`'s
 `verifying_key` and to `member list`'s. It is `null` when the author is no longer
@@ -306,6 +311,71 @@ their full key; get your own with `riverctl identity whoami <room-owner-vk>` and
 compare like against like (see "Managing your identity" above). Inside `reply_to`,
 `author` is a display **nickname**, not an ID — the id there is `author_id`, and
 it has no full-key sibling, so it is not something to trust on.
+
+### Running `message stream` as a long-lived bot
+
+River occasionally re-keys its room contract, which moves every room to a new
+address. A running `message stream` checks for this every few minutes. When it
+sees one, it **exits with status 75** and says so on stderr:
+
+```text
+River's pointer now names a different room-contract generation than this command started with.
+  was: <old generation>
+  now: <new generation>
+Exiting with status 75 so it can be restarted; a restarted riverctl uses the current generation.
+```
+
+A restarted `riverctl` looks up the new address and carries on streaming from
+it. So **run a bot under something that restarts it on any failure, with a short
+delay** — not only on status 75. A bot with no restart wrapper at all will now
+**stop** after a re-key, where it used to keep running but silently stop receiving
+messages. Right after a re-key the restarted process can
+fail until the room has been moved to the new address, and a wrapper that gives up
+on anything other than 75 would stop the bot for good.
+
+With systemd, the relevant `[Service]` lines:
+
+```ini
+[Service]
+ExecStart=/usr/local/bin/riverctl message stream <room-owner-vk> --format json
+Restart=on-failure
+RestartSec=5
+```
+
+`RestartSec` matters: without it, a few quick failures in a row can trip
+systemd's start limit and leave the unit stopped.
+
+Or as a script (save it to a file rather than pasting it into an interactive
+shell):
+
+```bash
+#!/bin/sh
+while true; do
+  riverctl message stream <room-owner-vk> --format json
+  status=$?
+  [ "$status" -eq 75 ] || echo "riverctl exited with status $status; restarting" >&2
+  sleep 5
+done
+```
+
+Status 75 is `EX_TEMPFAIL` ("temporary failure, retry"), distinct from the status
+1 every other failure uses. It is there so a wrapper can tell an expected restart
+from a real failure — for example, to alert only on the latter — not because other
+failures should be left stopped.
+
+**Restarting can re-deliver messages.** A restarted stream starts with no memory
+of what it already emitted. With `--initial-messages N`, it re-emits the last N
+messages as new, which covers up to N messages sent while it was restarting but
+repeats what you had already seen. If the bot acts on messages, deduplicate on
+`message_id`. Without `--initial-messages`, nothing is repeated, but messages sent
+during the restart are not shown.
+
+If River has re-keyed to a version **newer than your riverctl**, the restarted
+process still streams the room once it has been moved to the new address, and
+prints a warning telling you to upgrade (`cargo install riverctl`). Until the room
+has been moved — which an up-to-date River client does when someone opens it —
+`--subscribe` keeps failing and being restarted, while polling mode stays running
+and keeps retrying.
 
 ## Configuration
 

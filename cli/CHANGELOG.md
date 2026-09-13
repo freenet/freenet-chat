@@ -2,6 +2,32 @@
 
 All notable changes to riverctl will be documented in this file.
 
+## [0.2.18] - 2026-09-12
+
+### Fixed
+- `message stream` no longer goes silently deaf when River re-keys the room
+  contract while it is running. It used to look up the room's address once at
+  startup and never again, so after a re-key it kept listening to a contract
+  nobody writes to: no error, no output, just a room that appeared to go quiet
+  until the bot was restarted. It now re-checks every few minutes and, when
+  River's pointer names a different generation, **exits with status 75** so a
+  supervisor restarts it. A restarted riverctl uses the current generation.
+  (freenet/river#694)
+
+  **If you run a bot, run it under something that restarts it on any failure,
+  with a short delay** (systemd `Restart=on-failure` plus `RestartSec=`), and
+  note that a restart with `--initial-messages N` re-emits the last N messages.
+  See "Running `message stream` as a long-lived bot" in the README.
+- `message stream` without `--subscribe` no longer re-emits the room's recent
+  history when it starts. It recorded only the messages it displayed, so with the
+  default `--initial-messages 0` the first poll reported every recent message as
+  new, and with `-i N` it reported all but N of them. It now records everything
+  already in the room and shows only the last N, as `--subscribe` always has.
+  This matters more now that streams restart on every re-key.
+- A polling `message stream` whose `--poll-interval` is longer than the re-check
+  interval (a few minutes) now also polls at each re-check, so a long interval
+  cannot delay noticing a re-key.
+
 ## [0.2.15] - 2026-09-06
 
 ### Fixed

@@ -426,7 +426,27 @@ impl Storage {
             } else {
                 FloorStore::default()
             };
-            store.floors.insert(key.to_string(), floor);
+            // Never move a floor backwards, even if the caller asks to. The
+            // read-then-save here is not atomic with the caller's resolution: a
+            // long-running stream re-resolves every few minutes, so another
+            // riverctl sharing this config directory can advance the floor between
+            // this process loading it and saving it. Blindly inserting would then
+            // overwrite the newer floor with an older one, and every later process
+            // would accept records the newer floor exists to reject. Deciding
+            // under the lock, by the same rule the resolver uses, keeps the
+            // persisted floor monotonic. A stored entry that will not decode is
+            // replaced, which is what this did before; loading surfaces that
+            // corruption elsewhere.
+            let chosen = match (
+                store.floors.get(key).map(StoredFloor::to_floor),
+                floor.to_floor(),
+            ) {
+                (Some(Ok(stored)), Ok(proposed)) => {
+                    StoredFloor::from_floor(&crate::pointer::highest_floor(Some(proposed), stored))
+                }
+                _ => floor,
+            };
+            store.floors.insert(key.to_string(), chosen);
             Self::atomic_write(
                 &self.pointer_floors_path,
                 &serde_json::to_string_pretty(&store)?,
@@ -2191,6 +2211,163 @@ mod tests {
         );
     }
 
+    /// Source-grep pin: BOTH `message stream` loops must re-check River's
+    /// pointer, and the subscription loop must re-fetch after doing so.
+    ///
+    /// The decision logic is unit-tested; nothing else notices a loop that stops
+    /// calling it, and the symptom of that — a stream silently listening to a
+    /// retired contract — is the bug this exists to fix (freenet/river#694).
+    ///
+    /// In storage.rs so the pinned strings are not satisfied by this test's own
+    /// source.
+    #[test]
+    fn both_stream_loops_recheck_the_room_contract_pointer() {
+        let api_src = include_str!("api.rs");
+        let body_of = |start: &str, end: &str| -> &str {
+            api_src
+                .split_once(start)
+                .and_then(|(_, rest)| rest.split_once(end))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("could not isolate the body after `{start}`"))
+        };
+
+        for (name, body) in [
+            (
+                "stream_messages (polling)",
+                body_of(
+                    "    pub async fn stream_messages(",
+                    "\n    fn emit_new_and_edited(",
+                ),
+            ),
+            (
+                "subscribe_and_stream",
+                body_of("    pub async fn subscribe_and_stream(", "\n    }\n"),
+            ),
+        ] {
+            let call = body
+                .find("Self::act_on_recheck(self.recheck_room_anchor().await")
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{name} must re-check the pointer and act on the result; without it a \
+                         re-key leaves the stream listening to a contract nobody writes to"
+                    )
+                });
+            // And behind its timer. Without the gate the re-check fires on every
+            // loop iteration — a pointer GET per poll, and in lockstep across a
+            // fleet — and every other test here still passes.
+            let gate = body
+                .find("if std::time::Instant::now() >= next_recheck {")
+                .unwrap_or_else(|| panic!("{name} must gate the re-check on its interval"));
+            assert!(
+                gate < call && !body[gate..call].contains("\n            }"),
+                "{name}'s re-check must sit INSIDE the `>= next_recheck` gate"
+            );
+            // And the gate must be re-armed each time it fires, or after the first
+            // expiry it stays open and the re-check runs on every iteration.
+            assert!(
+                body[gate..call]
+                    .contains("next_recheck = std::time::Instant::now() + recheck_delay();"),
+                "{name} must reset `next_recheck` inside the gate before re-checking"
+            );
+        }
+
+        // The subscription loop's re-check reads from the same connection and can
+        // discard a notification for this room, so it must queue a re-fetch.
+        let sub = body_of("    pub async fn subscribe_and_stream(", "\n    }\n");
+        let recheck_at = sub.find("Self::act_on_recheck(").expect("checked above");
+        let refetch_at = sub[recheck_at..]
+            .find("pending.push_back(")
+            .map(|i| recheck_at + i);
+        let next_lock = sub[recheck_at..]
+            .find("let mut web_api = self.web_api.lock().await;")
+            .map(|i| recheck_at + i)
+            .expect("the loop must take the connection lock after the re-check");
+        assert!(
+            refetch_at.is_some_and(|r| r < next_lock),
+            "after re-checking the pointer, subscribe_and_stream must queue a re-fetch \
+             before it next reads the connection, or a message that arrived during the \
+             re-check stays unseen"
+        );
+    }
+
+    /// Source-grep pins for two wirings whose only symptom when lost is silent.
+    ///
+    /// 1. `resolve_pointer` must REMEMBER each floor it verifies, before the
+    ///    best-effort save, and consult that memory on every resolution. The
+    ///    comparison (`pointer::highest_floor`) is unit-tested, but an
+    ///    `ApiClient` cannot be built without a live connection, so nothing else
+    ///    notices the call being dropped — and dropping it reopens the case where
+    ///    a read-only config dir lets a periodic re-check accept an older signed
+    ///    record.
+    /// 2. The polling stream must SEED before it emits, both at startup and on the
+    ///    first successful poll if the startup fetch failed. Without it the first
+    ///    poll reports the room's whole recent history as new, on every restart.
+    #[test]
+    fn floor_memory_and_stream_seeding_are_wired() {
+        let api_src = include_str!("api.rs");
+        let body_of = |start: &str| -> &str {
+            api_src
+                .split_once(start)
+                .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("could not isolate the body after `{start}`"))
+        };
+
+        let resolve = body_of("    async fn resolve_pointer(");
+        assert!(
+            resolve.contains("highest_floor(self.remembered_floor(), on_disk)"),
+            "resolve_pointer must consult the floor this process already verified"
+        );
+        let remember = resolve
+            .find("self.remember_floor(next);")
+            .expect("resolve_pointer must remember each floor it verifies");
+        let save = resolve
+            .find(".save_pointer_floor(")
+            .expect("resolve_pointer still persists the floor");
+        assert!(
+            remember < save,
+            "the floor must be remembered BEFORE the best-effort save, so a failed save \
+             cannot skip it"
+        );
+
+        let polling = body_of("    pub async fn stream_messages(");
+        assert_eq!(
+            polling.matches("Self::seed_stream(").count(),
+            2,
+            "stream_messages must seed at startup AND on the first successful poll if \
+             startup could not fetch"
+        );
+        assert!(
+            polling.contains("Ok(mut room_state) if !seeded =>"),
+            "an unseeded polling stream must seed instead of emitting"
+        );
+        // Each seed must actually MARK the stream seeded, or the `!seeded` arm
+        // keeps re-seeding — re-printing the initial window on every poll.
+        for (i, _) in polling.match_indices("Self::seed_stream(") {
+            let after = &polling[i..];
+            let next_arm = after[1..]
+                .find("Self::")
+                .map(|j| j + 1)
+                .unwrap_or(after.len());
+            assert!(
+                after[..after.len().min(next_arm.max(400))].contains("seeded = true;"),
+                "every seed_stream call in stream_messages must be followed by `seeded = true;`"
+            );
+        }
+        // And seeding must suppress deletions of messages it did not show.
+        let seed = body_of("    fn seed_stream(");
+        assert!(
+            seed.contains("deleted_emitted.extend(deletions_to_suppress_at_start("),
+            "seed_stream must suppress deletions of messages it did not show (#324)"
+        );
+        // The poll sleep must not outlast the next re-check, or a long
+        // `--poll-interval` defeats the re-check interval entirely.
+        assert!(
+            polling.contains(".min(until_recheck)"),
+            "stream_messages must cap its poll sleep at the next re-check"
+        );
+    }
+
     /// Source-grep pins for the monitor edit/reply wiring (PR #322), in
     /// storage.rs so the pinned strings aren't self-satisfied by the scanned
     /// file (api.rs). Guards the exact regressions the PR fixed: a refactor
@@ -2299,6 +2476,56 @@ mod tests {
         assert_eq!(
             retrieved_state.configuration.configuration.max_members,
             state.configuration.configuration.max_members
+        );
+    }
+
+    /// A floor save must never move the persisted floor backwards. Another
+    /// riverctl sharing the config directory can advance it between a stream's
+    /// load and its save, and a blind overwrite would then let every later
+    /// process accept records that floor exists to reject.
+    #[test]
+    fn saving_an_older_pointer_floor_does_not_regress_the_stored_one() {
+        use freenet_migrate::pointer::PointerFloor;
+        let (storage, _temp_dir) = create_test_storage();
+        let key = "river.room-contract";
+        let stored = |s: &Storage| {
+            s.load_pointer_floor(key)
+                .unwrap()
+                .expect("a floor was saved")
+                .to_floor()
+                .unwrap()
+        };
+
+        let newer = PointerFloor::at(9, [0xBB; 32]).unwrap();
+        let older = PointerFloor::at(3, [0xAA; 32]).unwrap();
+        storage
+            .save_pointer_floor(key, StoredFloor::from_floor(&newer))
+            .unwrap();
+        storage
+            .save_pointer_floor(key, StoredFloor::from_floor(&older))
+            .unwrap();
+        assert_eq!(stored(&storage).version(), 9, "an older save must not win");
+
+        // A genuinely newer floor still replaces it.
+        let newest = PointerFloor::at(12, [0xCC; 32]).unwrap();
+        storage
+            .save_pointer_floor(key, StoredFloor::from_floor(&newest))
+            .unwrap();
+        assert_eq!(stored(&storage).version(), 12);
+
+        // Equal versions follow the resolver's tiebreak: the lower hash stays.
+        let lower = PointerFloor::at(12, [0x11; 32]).unwrap();
+        storage
+            .save_pointer_floor(key, StoredFloor::from_floor(&lower))
+            .unwrap();
+        assert_eq!(stored(&storage).code_hash(), Some([0x11; 32]));
+        storage
+            .save_pointer_floor(key, StoredFloor::from_floor(&newest))
+            .unwrap();
+        assert_eq!(
+            stored(&storage).code_hash(),
+            Some([0x11; 32]),
+            "the higher hash at the same version must not replace the lower"
         );
     }
 

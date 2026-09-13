@@ -329,6 +329,92 @@ impl RoomAnchor {
     }
 }
 
+/// What a long-running command should do after re-checking River's pointer.
+///
+/// A long-running command (`message stream`) resolves the room-contract
+/// generation once, at startup, like every other command. If River re-keys while
+/// it runs, the room's address changes underneath it and it would otherwise keep
+/// listening to a contract nobody writes to, with no error (freenet/river#694).
+///
+/// It does not try to follow the move in place. Everything a re-key needs —
+/// resolving the new generation, migrating the room, healing membership,
+/// subscribing — is what a fresh process already does at startup, through code
+/// that runs on every invocation. A mid-run copy of all that was tried in #696
+/// and did not survive review. So the answer to "River re-keyed" is to exit and
+/// be restarted.
+///
+/// That holds even when the new generation is one this binary does not know. A
+/// stream only reads, and reads are permitted against any generation (see
+/// [`RoomAnchor::authorize`]), so a restarted process can stream the new
+/// generation as soon as anyone has moved the room there — while a process that
+/// stayed put would keep listening to the retired one. The restarted process also
+/// prints the existing "this riverctl is older than River's room contract"
+/// advisory, which is what tells the operator to upgrade.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recheck {
+    /// Nothing that should change what this process is doing.
+    Unchanged,
+    /// River's pointer now names a different generation: exit and be restarted.
+    Moved { from: [u8; 32], to: [u8; 32] },
+}
+
+/// Compare a freshly-resolved anchor with the one a command started with.
+///
+/// Only a signature-verified record counts as a move. A re-check that could not
+/// reach the pointer still produces an anchor — on the last hash this install
+/// persisted, or the BUNDLED hash if it never persisted one — and that fallback
+/// can differ from the generation in use without River having re-keyed at all.
+/// Restarting on it would make a single timeout look like a re-key.
+pub fn recheck(in_force: &RoomAnchor, fresh: &RoomAnchor) -> Recheck {
+    if fresh.code_hash() == in_force.code_hash() || fresh.source() != &AnchorSource::Pointer {
+        return Recheck::Unchanged;
+    }
+    Recheck::Moved {
+        from: *in_force.code_hash(),
+        to: *fresh.code_hash(),
+    }
+}
+
+/// The higher of a floor this process has already verified and the one just
+/// read from disk.
+///
+/// The anti-rollback floor is what makes a genuinely-signed OLDER record
+/// unusable, and it is re-read from disk on every resolution. Persisting it is
+/// best-effort, though (a read-only config directory is enough to skip it), so
+/// the disk can be behind what this process verified at startup. A periodic
+/// re-check reading only the disk would then accept an older signed record as a
+/// move and restart onto it. A signature establishes authenticity, not
+/// freshness; this supplies the freshness the disk could not.
+///
+/// "Higher" is by version. At EQUAL versions it applies the same tiebreak the
+/// pointer resolver and the network's merge converge on: a withdrawal first (a
+/// tombstone sorts below every real code hash, and dropping it would resurrect
+/// what the author retired), then the LOWER code hash. Picking by any other rule
+/// at equal versions could keep the record the network discards, and a re-check
+/// would then read the canonical record as a move.
+pub fn highest_floor(remembered: Option<PointerFloor>, on_disk: PointerFloor) -> PointerFloor {
+    let Some(mem) = remembered else {
+        return on_disk;
+    };
+    if mem.version() != on_disk.version() {
+        return if mem.version() > on_disk.version() {
+            mem
+        } else {
+            on_disk
+        };
+    }
+    if mem.is_withdrawn() {
+        return mem;
+    }
+    if on_disk.is_withdrawn() {
+        return on_disk;
+    }
+    match (mem.code_hash(), on_disk.code_hash()) {
+        (Some(m), Some(d)) if m < d => mem,
+        _ => on_disk,
+    }
+}
+
 /// What a resolution attempt produced, flattened so the arm-by-arm mapping
 /// below is a pure function that needs no node and no generic error type.
 #[derive(Debug, Clone)]
@@ -678,6 +764,124 @@ mod tests {
             ROOM_CONTRACT_POINTER_KEY,
             "the author key and app_id in this module no longer derive the pointer address \
              published in FREENET.md"
+        );
+    }
+
+    /// Resolve an anchor from a genuine signed record naming `hash`.
+    fn verified(hash: [u8; 32]) -> RoomAnchor {
+        let author = SigningKey::from_bytes(&[3u8; 32]);
+        anchor_from_report(
+            &ResolveReport::Outcome(outcome_for(
+                &author,
+                PointerFloor::never_resolved(),
+                4,
+                hash,
+            )),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap()
+    }
+
+    /// A re-check that names the generation already in use changes nothing.
+    #[test]
+    fn recheck_ignores_a_reconfirmed_generation() {
+        let anchor = verified(bundled());
+        assert_eq!(recheck(&anchor, &anchor), Recheck::Unchanged);
+    }
+
+    /// The case that makes "restart on any hash change" wrong. A re-check that
+    /// could not reach the pointer falls back to the last persisted hash, or the
+    /// bundled one, and that can differ from the generation in use with no
+    /// re-key having happened. Restarting on it would turn a timeout into a
+    /// restart.
+    #[test]
+    fn recheck_ignores_an_unverified_hash_change() {
+        let legacy = river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES[3];
+        let in_force = verified(legacy);
+        // Unreachable pointer, never-persisted floor: the fallback is bundled.
+        let fallback = anchor_from_report(
+            &ResolveReport::Failed("timed out".to_string()),
+            &PointerFloor::never_resolved(),
+            bundled(),
+        )
+        .unwrap();
+        assert_ne!(fallback.code_hash(), in_force.code_hash());
+        assert_eq!(recheck(&in_force, &fallback), Recheck::Unchanged);
+    }
+
+    /// A verified re-key to a generation this binary knows: restart.
+    #[test]
+    fn recheck_restarts_for_a_verified_move_to_a_known_generation() {
+        let legacy = river_core::migration::LEGACY_ROOM_CONTRACT_CODE_HASHES[3];
+        assert_eq!(
+            recheck(&verified(legacy), &verified(bundled())),
+            Recheck::Moved {
+                from: legacy,
+                to: bundled()
+            }
+        );
+    }
+
+    /// A verified re-key PAST this binary restarts too. A stream only reads, and
+    /// reads are permitted against an unknown generation, so a restarted process
+    /// can stream it once the room has been moved there; staying put would keep
+    /// listening to the retired generation.
+    #[test]
+    fn recheck_restarts_for_a_verified_move_past_this_binary_too() {
+        let past_us = verified([0x11; 32]);
+        assert_eq!(past_us.generation(), Generation::Unknown);
+        past_us
+            .authorize(KeyIntent::Read)
+            .expect("the premise: a stale riverctl may READ an unknown generation");
+        assert_eq!(
+            recheck(&verified(bundled()), &past_us),
+            Recheck::Moved {
+                from: bundled(),
+                to: [0x11; 32]
+            }
+        );
+    }
+
+    /// If the floor could not be saved, the disk can be behind what this process
+    /// verified. The remembered floor must win, or an older signed record would be
+    /// accepted as a move.
+    #[test]
+    fn the_remembered_floor_beats_a_disk_that_fell_behind() {
+        let old = PointerFloor::at(3, [0xAA; 32]).unwrap();
+        let new = PointerFloor::at(9, [0xBB; 32]).unwrap();
+
+        assert_eq!(
+            highest_floor(None, old).version(),
+            3,
+            "nothing remembered yet"
+        );
+        assert_eq!(
+            highest_floor(Some(new), old).version(),
+            9,
+            "disk fell behind"
+        );
+        assert_eq!(highest_floor(Some(old), new).version(), 9, "disk is ahead");
+
+        // Equal versions: a withdrawal wins from either side.
+        let tombstone = PointerFloor::withdrawn_at(9).unwrap();
+        let live_at_9 = PointerFloor::at(9, [0xCC; 32]).unwrap();
+        assert!(highest_floor(Some(tombstone), live_at_9).is_withdrawn());
+        assert!(highest_floor(Some(live_at_9), tombstone).is_withdrawn());
+
+        // Equal versions, two real records: the LOWER code hash wins, from either
+        // side, matching the resolver's tiebreak. Otherwise a failed save could
+        // leave the disk holding the record the network discards, and a re-check
+        // would read the canonical one as a move.
+        let lower = PointerFloor::at(9, [0x11; 32]).unwrap();
+        let higher = PointerFloor::at(9, [0xEE; 32]).unwrap();
+        assert_eq!(
+            highest_floor(Some(lower), higher).code_hash(),
+            Some([0x11; 32])
+        );
+        assert_eq!(
+            highest_floor(Some(higher), lower).code_hash(),
+            Some([0x11; 32])
         );
     }
 

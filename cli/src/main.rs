@@ -120,7 +120,22 @@ enum Commands {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            // See `riverctl::error::report`. Written with the error ignored, like
+            // the std `Termination` impl this replaces: a closed stderr must not
+            // turn an ordinary failure into a panic.
+            let (message, code) = riverctl::error::report(&e);
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{message}");
+            std::process::ExitCode::from(code)
+        }
+    }
+}
+
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Initialize logging (keep stdout clean for user/JSON output)
