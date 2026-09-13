@@ -125,7 +125,9 @@ riverctl message stream <room-owner-vk> --format json --no-version-check |
 ```
 
 For a bot that runs unattended, wrap this in something that restarts it — see
-"Running `message stream` as a long-lived bot" below.
+"Running `message stream` as a long-lived bot" below. Note that a pipeline's exit
+status is the LAST command's, so a wrapper around this one sees `jq`'s status, not
+riverctl's; use `set -o pipefail` in bash, or restart on any exit.
 
 `message list` and `message stream --format json` both carry
 `author_verifying_key` — the author's full base58 key, comparable to `whoami`'s
@@ -323,13 +325,15 @@ River's pointer now names a different room-contract generation than this command
 Exiting with status 75 so it can be restarted; a restarted riverctl uses the current generation.
 ```
 
-A restarted `riverctl` looks up the new address and subscribes to it. So **run a
-bot under something that restarts it on any failure, with a short delay** — not
-only on status 75. Right after a re-key, the restarted process can briefly fail
-too (the room may not have been moved to the new address yet), and a wrapper that
-gives up on anything other than 75 would stop the bot for good.
+A restarted `riverctl` looks up the new address and carries on streaming from
+it. So **run a bot under something that restarts it on any failure, with a short
+delay** — not only on status 75. A bot with no restart wrapper at all will now
+**stop** after a re-key, where it used to keep running but silently stop receiving
+messages. Right after a re-key the restarted process can
+fail until the room has been moved to the new address, and a wrapper that gives up
+on anything other than 75 would stop the bot for good.
 
-With systemd:
+With systemd, the relevant `[Service]` lines:
 
 ```ini
 [Service]
@@ -368,7 +372,9 @@ during the restart are not shown.
 
 If River has re-keyed to a version **newer than your riverctl**, the restarted
 process still streams the room once it has been moved to the new address, and
-prints a warning telling you to upgrade (`cargo install riverctl --force`).
+prints a warning telling you to upgrade (`cargo install riverctl`). Until the room
+has been moved — which an up-to-date River client does when someone opens it — it
+keeps failing and being restarted.
 
 ## Configuration
 

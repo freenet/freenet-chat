@@ -18,6 +18,12 @@ All notable changes to riverctl will be documented in this file.
   with a short delay** (systemd `Restart=on-failure` plus `RestartSec=`), and
   note that a restart with `--initial-messages N` re-emits the last N messages.
   See "Running `message stream` as a long-lived bot" in the README.
+- `message stream` without `--subscribe` no longer re-emits the room's recent
+  history when it starts. It recorded only the messages it displayed, so with the
+  default `--initial-messages 0` the first poll reported every recent message as
+  new, and with `-i N` it reported all but N of them. It now records everything
+  already in the room and shows only the last N, as `--subscribe` always has.
+  This matters more now that streams restart on every re-key.
 
 ## [0.2.15] - 2026-09-06
 

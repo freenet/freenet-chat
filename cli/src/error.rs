@@ -31,7 +31,9 @@ pub enum CliError {
 /// "restart me" apart from a real failure without parsing stderr.
 pub const EXIT_ROOM_CONTRACT_REKEYED: u8 = 75;
 
-/// River re-keyed the room contract while a long-running command was running.
+/// River's pointer names a different room-contract generation than the one a
+/// long-running command started with — usually because River re-keyed while it
+/// ran, sometimes because the command started on a fallback it could not verify.
 ///
 /// Not a failure of the command. The process stops so it can be restarted, and
 /// the restarted process follows the new generation through the normal startup

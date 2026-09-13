@@ -2242,6 +2242,13 @@ mod tests {
                 gate < call && !body[gate..call].contains("\n            }"),
                 "{name}'s re-check must sit INSIDE the `>= next_recheck` gate"
             );
+            // And the gate must be re-armed each time it fires, or after the first
+            // expiry it stays open and the re-check runs on every iteration.
+            assert!(
+                body[gate..call]
+                    .contains("next_recheck = std::time::Instant::now() + recheck_delay();"),
+                "{name} must reset `next_recheck` inside the gate before re-checking"
+            );
         }
 
         // The subscription loop's re-check reads from the same connection and can
@@ -2260,6 +2267,59 @@ mod tests {
             "after re-checking the pointer, subscribe_and_stream must queue a re-fetch \
              before it next reads the connection, or a message that arrived during the \
              re-check stays unseen"
+        );
+    }
+
+    /// Source-grep pins for two wirings whose only symptom when lost is silent.
+    ///
+    /// 1. `resolve_pointer` must REMEMBER each floor it verifies, before the
+    ///    best-effort save, and consult that memory on every resolution. The
+    ///    comparison (`pointer::highest_floor`) is unit-tested, but an
+    ///    `ApiClient` cannot be built without a live connection, so nothing else
+    ///    notices the call being dropped — and dropping it reopens the case where
+    ///    a read-only config dir lets a periodic re-check accept an older signed
+    ///    record.
+    /// 2. The polling stream must SEED before it emits, both at startup and on the
+    ///    first successful poll if the startup fetch failed. Without it the first
+    ///    poll reports the room's whole recent history as new, on every restart.
+    #[test]
+    fn floor_memory_and_stream_seeding_are_wired() {
+        let api_src = include_str!("api.rs");
+        let body_of = |start: &str| -> &str {
+            api_src
+                .split_once(start)
+                .and_then(|(_, rest)| rest.split_once("\n    }\n"))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("could not isolate the body after `{start}`"))
+        };
+
+        let resolve = body_of("    async fn resolve_pointer(");
+        assert!(
+            resolve.contains("highest_floor(self.remembered_floor(), on_disk)"),
+            "resolve_pointer must consult the floor this process already verified"
+        );
+        let remember = resolve
+            .find("self.remember_floor(next);")
+            .expect("resolve_pointer must remember each floor it verifies");
+        let save = resolve
+            .find(".save_pointer_floor(")
+            .expect("resolve_pointer still persists the floor");
+        assert!(
+            remember < save,
+            "the floor must be remembered BEFORE the best-effort save, so a failed save \
+             cannot skip it"
+        );
+
+        let polling = body_of("    pub async fn stream_messages(");
+        assert_eq!(
+            polling.matches("Self::seed_stream(").count(),
+            2,
+            "stream_messages must seed at startup AND on the first successful poll if \
+             startup could not fetch"
+        );
+        assert!(
+            polling.contains("Ok(mut room_state) if !seeded =>"),
+            "an unseeded polling stream must seed instead of emitting"
         );
     }
 

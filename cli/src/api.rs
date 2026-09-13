@@ -2487,9 +2487,10 @@ impl ApiClient {
             None => PointerFloor::never_resolved(),
         };
         // Whichever is higher: the disk's floor, or the highest this process has
-        // already verified. They differ only when a save failed, which is exactly
-        // when relying on the disk alone would let a periodic re-check accept an
-        // older signed record. See `crate::pointer::highest_floor`.
+        // already verified. They differ when a save failed — exactly when relying
+        // on the disk alone would let a periodic re-check accept an older signed
+        // record — or when another riverctl has written the disk since. See
+        // `crate::pointer::highest_floor`.
         let floor = crate::pointer::highest_floor(self.remembered_floor(), on_disk);
 
         let mut io = NodePointerIo {
@@ -2546,8 +2547,9 @@ impl ApiClient {
     /// ([`crate::error::RoomContractRekeyed`], exit status 75, restart me), or the
     /// re-check itself failed. The second is not a timeout — an unreachable
     /// pointer comes back as an unverified anchor, not an error — so what reaches
-    /// here is a corrupt anti-rollback floor or a signed withdrawal, both of which
-    /// a fresh process would also refuse at startup.
+    /// here is a corrupt or unreadable anti-rollback floor, or a signed withdrawal.
+    /// A fresh process would refuse those at startup too, so ending the stream as
+    /// an ordinary failure (status 1) is the honest report.
     fn act_on_recheck(result: Result<crate::pointer::Recheck>) -> Result<()> {
         use crate::pointer::{code_hash_b58, Recheck};
         match result? {
@@ -5261,32 +5263,26 @@ impl ApiClient {
         let mut new_message_count = 0;
         let start_time = std::time::Instant::now();
 
-        // Show initial messages if requested
-        if initial_messages > 0 {
-            let mut room_state = self.get_room(room_owner_key, false).await?;
-            // Decrypt private-room content for display (no-op for public rooms).
-            let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
-
-            // Use display_messages() to filter out action/deleted messages (matches `message list`)
-            let all_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
-            let start = all_msgs.len().saturating_sub(initial_messages);
-
-            for msg in &all_msgs[start..] {
-                let key = monitor_seen_key(msg);
-                seen_messages.insert(
-                    key.clone(),
-                    message_display_text_with_secrets(&room_state, msg, &secrets),
-                );
-                // Seed the reactions fingerprint for shown messages so reactions
-                // already present at startup aren't re-emitted as a live change;
-                // only later changes to them surface.
-                seen_reactions.insert(
-                    key,
-                    reactions_fingerprint(room_state.recent_messages.reactions(&msg.id())),
-                );
-
-                Self::output_message(&room_state, msg, room_owner_key, &format, false, &secrets)?;
+        // Record what the room already holds before streaming, so the first poll
+        // does not report it as new. See `seed_stream`. A failure here is not
+        // fatal — the loop retries — and until a fetch succeeds the stream simply
+        // is not seeded yet; the first successful poll seeds instead of emitting.
+        let mut seeded = false;
+        match self.get_room(room_owner_key, false).await {
+            Ok(mut room_state) => {
+                let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
+                Self::seed_stream(
+                    &room_state,
+                    &secrets,
+                    initial_messages,
+                    &mut seen_messages,
+                    &mut seen_reactions,
+                    room_owner_key,
+                    &format,
+                )?;
+                seeded = true;
             }
+            Err(e) => debug!("Could not fetch room state at stream start (will retry): {e}"),
         }
 
         // Set up Ctrl+C handler
@@ -5333,6 +5329,19 @@ impl ApiClient {
             // message whose effective content changed (an edit) and emits ones
             // not seen before; it respects max_messages for NEW messages.
             match self.get_room(room_owner_key, false).await {
+                Ok(mut room_state) if !seeded => {
+                    let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
+                    Self::seed_stream(
+                        &room_state,
+                        &secrets,
+                        initial_messages,
+                        &mut seen_messages,
+                        &mut seen_reactions,
+                        room_owner_key,
+                        &format,
+                    )?;
+                    seeded = true;
+                }
                 Ok(mut room_state) => {
                     // Decrypt private-room content for display (no-op for public rooms).
                     let secrets = self.room_display_secrets(room_owner_key, &mut room_state);
@@ -5378,6 +5387,54 @@ impl ApiClient {
             // Wait for next poll interval
             tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
         }
+    }
+
+    /// Seed a polling stream with what the room already holds: every current
+    /// message is recorded as seen, and only the last `initial_messages` are
+    /// printed.
+    ///
+    /// Seeding the WHOLE window is the point, and it is what this used to get
+    /// wrong. The startup code recorded only the messages it displayed, so with
+    /// the default `--initial-messages 0` it recorded nothing, and the first poll
+    /// reported every recent message in the room as new; with `-i 5` it reported
+    /// all but five of them. That was an annoyance while restarts were rare. Once
+    /// a stream exits to be restarted on every room-contract re-key
+    /// (freenet/river#694), it would dump the room's recent history into a bot on
+    /// every re-key. The subscription path already seeds the whole window; this
+    /// brings polling into line.
+    ///
+    /// Seeds from `display_messages()`, which excludes deleted messages, so a
+    /// deletion that predates the stream is never in `seen` and needs no
+    /// suppression (see the note on `deleted_emitted` in `stream_messages`).
+    /// Reaction fingerprints are seeded only for the messages actually shown, the
+    /// same rule the subscription path follows: a reaction change on a message the
+    /// stream never displayed is not reported.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_stream(
+        room_state: &ChatRoomStateV1,
+        secrets: &HashMap<u32, [u8; 32]>,
+        initial_messages: usize,
+        seen_messages: &mut HashMap<String, String>,
+        seen_reactions: &mut HashMap<String, String>,
+        room_owner_key: &VerifyingKey,
+        format: &OutputFormat,
+    ) -> Result<()> {
+        let all_msgs: Vec<_> = room_state.recent_messages.display_messages().collect();
+        for msg in &all_msgs {
+            seen_messages.insert(
+                monitor_seen_key(msg),
+                message_display_text_with_secrets(room_state, msg, secrets),
+            );
+        }
+        let start = all_msgs.len().saturating_sub(initial_messages);
+        for msg in &all_msgs[start..] {
+            seen_reactions.insert(
+                monitor_seen_key(msg),
+                reactions_fingerprint(room_state.recent_messages.reactions(&msg.id())),
+            );
+            Self::output_message(room_state, msg, room_owner_key, format, false, secrets)?;
+        }
+        Ok(())
     }
 
     /// Scan the room's display messages and emit any that are NEW or whose
@@ -9703,6 +9760,76 @@ mod monitor_tests {
     /// A `ChatRoomStateV1` whose `recent_messages` contains `original` plus the
     /// given reaction action messages, with `actions_state` rebuilt so
     /// `reactions()` reflects them.
+    /// The polling stream's startup must record EVERY message the room already
+    /// holds, and print only the last `initial_messages`. It used to record only
+    /// the ones it printed, so the first poll re-emitted the rest as new: all of
+    /// them with the default `-i 0`. Once a stream restarts on every re-key
+    /// (freenet/river#694) that would dump the room's history into a bot each time.
+    #[test]
+    fn a_seeded_poll_of_an_unchanged_room_emits_nothing() {
+        let msgs: Vec<_> = ["one", "two", "three"]
+            .iter()
+            .map(|t| authored(RoomMessageBody::public(t.to_string())))
+            .collect();
+        let state = {
+            let mut recent = MessagesV1 {
+                messages: msgs,
+                ..Default::default()
+            };
+            recent.rebuild_actions_state();
+            ChatRoomStateV1 {
+                recent_messages: recent,
+                ..Default::default()
+            }
+        };
+        let owner_vk = SigningKey::from_bytes(&[6u8; 32]).verifying_key();
+        let secrets = HashMap::new();
+
+        for initial in [0usize, 1, 3] {
+            let mut seen = HashMap::new();
+            let mut deleted = HashSet::new();
+            let mut reactions = HashMap::new();
+            ApiClient::seed_stream(
+                &state,
+                &secrets,
+                initial,
+                &mut seen,
+                &mut reactions,
+                &owner_vk,
+                &OutputFormat::Json,
+            )
+            .unwrap();
+            assert_eq!(
+                seen.len(),
+                3,
+                "-i {initial}: every message must be recorded"
+            );
+            assert_eq!(
+                reactions.len(),
+                initial,
+                "-i {initial}: reactions are seeded only for the messages shown"
+            );
+
+            let mut new_count = 0usize;
+            ApiClient::emit_new_and_edited(
+                &state,
+                &mut seen,
+                &mut deleted,
+                &mut reactions,
+                &owner_vk,
+                &OutputFormat::Json,
+                0,
+                &mut new_count,
+                &secrets,
+            )
+            .unwrap();
+            assert_eq!(
+                new_count, 0,
+                "-i {initial}: the first poll of an unchanged room must emit nothing"
+            );
+        }
+    }
+
     fn state_with_reactions(
         original: &AuthorizedMessageV1,
         reaction_actions: Vec<AuthorizedMessageV1>,
