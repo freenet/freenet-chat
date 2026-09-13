@@ -5384,8 +5384,16 @@ impl ApiClient {
                 }
             }
 
-            // Wait for next poll interval
-            tokio::time::sleep(std::time::Duration::from_millis(poll_interval_ms)).await;
+            // Wait for the next poll — but never past the next re-check. With a
+            // `--poll-interval` longer than the re-check interval, sleeping the full
+            // interval would hold off noticing a re-key for as long as the interval
+            // (an hour, for an hourly poll). The cost is an extra poll at each
+            // re-check for such streams, which is one GET every few minutes.
+            let until_recheck = next_recheck.saturating_duration_since(std::time::Instant::now());
+            tokio::time::sleep(
+                std::time::Duration::from_millis(poll_interval_ms).min(until_recheck),
+            )
+            .await;
         }
     }
 

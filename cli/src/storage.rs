@@ -2321,6 +2321,12 @@ mod tests {
             polling.contains("Ok(mut room_state) if !seeded =>"),
             "an unseeded polling stream must seed instead of emitting"
         );
+        // The poll sleep must not outlast the next re-check, or a long
+        // `--poll-interval` defeats the re-check interval entirely.
+        assert!(
+            polling.contains(".min(until_recheck)"),
+            "stream_messages must cap its poll sleep at the next re-check"
+        );
     }
 
     /// Source-grep pins for the monitor edit/reply wiring (PR #322), in

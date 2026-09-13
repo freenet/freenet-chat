@@ -386,13 +386,31 @@ pub fn recheck(in_force: &RoomAnchor, fresh: &RoomAnchor) -> Recheck {
 /// move and restart onto it. A signature establishes authenticity, not
 /// freshness; this supplies the freshness the disk could not.
 ///
-/// "Higher" is by version, except that at EQUAL versions a withdrawal wins:
-/// dropping a tombstone for a same-version record would resurrect exactly what
-/// the author retired.
+/// "Higher" is by version. At EQUAL versions it applies the same tiebreak the
+/// pointer resolver and the network's merge converge on: a withdrawal first (a
+/// tombstone sorts below every real code hash, and dropping it would resurrect
+/// what the author retired), then the LOWER code hash. Picking by any other rule
+/// at equal versions could keep the record the network discards, and a re-check
+/// would then read the canonical record as a move.
 pub fn highest_floor(remembered: Option<PointerFloor>, on_disk: PointerFloor) -> PointerFloor {
-    match remembered {
-        Some(mem) if mem.version() > on_disk.version() => mem,
-        Some(mem) if mem.version() == on_disk.version() && mem.is_withdrawn() => mem,
+    let Some(mem) = remembered else {
+        return on_disk;
+    };
+    if mem.version() != on_disk.version() {
+        return if mem.version() > on_disk.version() {
+            mem
+        } else {
+            on_disk
+        };
+    }
+    if mem.is_withdrawn() {
+        return mem;
+    }
+    if on_disk.is_withdrawn() {
+        return on_disk;
+    }
+    match (mem.code_hash(), on_disk.code_hash()) {
+        (Some(m), Some(d)) if m < d => mem,
         _ => on_disk,
     }
 }
@@ -850,6 +868,21 @@ mod tests {
         let live_at_9 = PointerFloor::at(9, [0xCC; 32]).unwrap();
         assert!(highest_floor(Some(tombstone), live_at_9).is_withdrawn());
         assert!(highest_floor(Some(live_at_9), tombstone).is_withdrawn());
+
+        // Equal versions, two real records: the LOWER code hash wins, from either
+        // side, matching the resolver's tiebreak. Otherwise a failed save could
+        // leave the disk holding the record the network discards, and a re-check
+        // would read the canonical one as a move.
+        let lower = PointerFloor::at(9, [0x11; 32]).unwrap();
+        let higher = PointerFloor::at(9, [0xEE; 32]).unwrap();
+        assert_eq!(
+            highest_floor(Some(lower), higher).code_hash(),
+            Some([0x11; 32])
+        );
+        assert_eq!(
+            highest_floor(Some(higher), lower).code_hash(),
+            Some([0x11; 32])
+        );
     }
 
     #[test]
